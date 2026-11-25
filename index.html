@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>RoadSense: Overdrive</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel+Decorative:wght@700&family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<script src="script.js" defer></script>
+</head>
+<body class="is-pc">
+<div id="gameViewportWrapper">
+    <canvas id="gameCanvas" class="filter-standard"></canvas>
+    <div id="atmosphereOverlay"></div>
+    <div id="toastContainer"></div>
+
+    <!-- Epoch 250 Mutually Exclusive Alerts (Zero Overlap) -->
+    <div id="epoch250Alert">
+        <div class="holo-top-klaxon">
+            <div class="mono alert-kicker">ANOMALY // SINGULARITY BREACH</div>
+            <div class="title-cinzel alert-title">EPOCH 250 INBOUND</div>
+            <div class="mono alert-sub">VOID MAX &bull; 800M HORIZON</div>
+        </div>
+    </div>
+    <div id="singularityBanner" class="hud-collapsible">
+        <div class="singularity-pill mono">🌌 EPOCH 250 SINGULARITY &mdash; VOID MAX (800M)</div>
+    </div>
+
+    <!-- Boot Splash (Initial Gesture: Starts Music + Mobile Fullscreen) -->
+    <div id="bootSplashModal" class="modal-backdrop boot-backdrop" style="display:flex;z-index:95;">
+        <div class="hardware-panel modal-card boot-card">
+            <div class="row-center"><span class="badge badge-emerald mono">SYSTEM READY</span></div>
+            <h1 class="title-cinzel boot-title">ROADSENSE: OVERDRIVE</h1>
+            <p class="mono boot-hint">HIGH-SPEED NEURAL HIGHWAY ENGINE</p>
+            <button type="button" id="bootEnterBtn" class="btn btn-launch boot-enter-btn">▶ ENTER OVERDRIVE</button>
+            <div class="mono boot-subhint">TAP, CLICK OR PRESS [ENTER] TO START AUDIO</div>
+        </div>
+    </div>
+
+    <!-- FULL-SCREEN DYNAMIC MAIN MENU -->
+    <div id="startModal" class="modal-backdrop menu-fullscreen-backdrop" style="z-index:50;">
+        <div class="hardware-panel menu-shell">
+            <div class="modal-header menu-top-bar">
+                <div class="row" style="min-width:0;">
+                    <span class="status-dot-live"></span>
+                    <h1 class="title-cinzel truncate menu-brand-title">ROADSENSE: OVERDRIVE</h1>
+                </div>
+                <div class="row-wrap" style="flex-shrink:0;justify-content:flex-end;">
+                    <span id="rtSyncStatusBadge" class="badge badge-amber mono" title="Real-time cross-browser database status">🟡 SYNC</span>
+                    <span id="menuSeasonPill" class="badge badge-amber mono">S1 &bull; 3d 00h</span>
+                </div>
+            </div>
+
+            <div class="menu-content modal-scroll">
+                <div class="menu-grid">
+                    <!-- LEFT COLUMN: ACCOUNT / AUTH -->
+                    <div class="menu-col stack-sm">
+                        <!-- Active Account Strip (Shown when Logged In) -->
+                        <div id="menuAccountActiveCard" class="recessed-well hidden menu-card-pad">
+                            <div class="row-between" style="flex-wrap:wrap;gap:8px;">
+                                <div class="row" style="min-width:0;flex:1 1 180px;">
+                                    <span id="menuPilotColorDot" class="pilot-dot-lg"></span>
+                                    <div style="min-width:0;flex:1;">
+                                        <div class="row-wrap" style="gap:6px;">
+                                            <strong id="menuPilotName" class="truncate pilot-name-lg">Pilot</strong>
+                                            <button type="button" id="menuPilotTagRevealBtn" class="reveal-pill" onclick="toggleRevealField('menuTag')" title="Click to reveal ID">#•••• 👁</button>
+                                            <span id="menuPilotRoleBadge" class="badge hidden mono"></span>
+                                        </div>
+                                        <div class="row-wrap" style="margin-top:5px;gap:6px;">
+                                            <button type="button" id="menuPilotUidRevealBtn" class="reveal-pill" onclick="toggleRevealField('menuUid')" title="Click to reveal 17-digit UID">UID: •••• •••• •••• ••••• 👁</button>
+                                            <button type="button" id="menuCopyUidBtn" class="btn btn-xs btn-emerald hidden" onclick="copyCurrentAccountUid('menuCopyUidBtn')">📋 Copy</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="row-wrap">
+                                    <button type="button" class="btn btn-xs" onclick="openSettingsModal('profile')">👤 Profile</button>
+                                    <button type="button" class="btn btn-xs btn-danger" onclick="logoutActiveAccount()">⏻ Logout</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Previous Account Card (Shown ONLY after Logout — NO Profile/Switch buttons, ONLY Name + Hidden Click-to-Reveal ID & UID) -->
+                        <div id="menuPrevAccountCard" class="recessed-well hidden menu-card-pad prev-acc-card">
+                            <div class="mono prev-acc-label">PREVIOUS ACCOUNT</div>
+                            <div class="row-wrap" style="gap:6px;">
+                                <span id="prevPilotColorDot" class="pilot-dot-md"></span>
+                                <strong id="prevPilotName" class="truncate pilot-name-lg">Pilot</strong>
+                                <button type="button" id="prevPilotTagRevealBtn" class="reveal-pill" onclick="toggleRevealField('prevTag')" title="Click to reveal ID">#•••• 👁</button>
+                            </div>
+                            <div class="row-wrap" style="margin-top:6px;gap:6px;">
+                                <button type="button" id="prevPilotUidRevealBtn" class="reveal-pill" onclick="toggleRevealField('prevUid')" title="Click to reveal 17-digit UID">UID: •••• •••• •••• ••••• 👁</button>
+                                <button type="button" id="prevCopyUidBtn" class="btn btn-xs btn-emerald hidden" onclick="copyPrevAccountUid('prevCopyUidBtn')">📋 Copy</button>
+                            </div>
+                        </div>
+
+                        <!-- Sign In / New Pilot Card -->
+                        <div id="menuAuthCard" class="recessed-well menu-card-pad">
+                            <div class="row-between" style="margin-bottom:8px;flex-wrap:wrap;">
+                                <div class="row-wrap" style="gap:6px;">
+                                    <button type="button" id="authTabCreate" class="btn btn-xs btn-sky active" onclick="switchAuthSubTab('create')">New Pilot</button>
+                                    <button type="button" id="authTabLogin" class="btn btn-xs" onclick="switchAuthSubTab('login')">Sign In (UID)</button>
+                                </div>
+                                <span class="mono" style="font-size:9px;color:var(--text-dim);">UNIQUE 17-DIGIT UID</span>
+                            </div>
+
+                            <div id="authCreatePane" class="row-wrap">
+                                <input type="text" id="regNameInput" maxlength="28" autocomplete="off" placeholder="Pilot Name (Any)" style="flex:2 1 125px;min-width:105px;" onkeydown="if(event.key==='Enter')createNewPilotAccount()">
+                                <input type="text" id="regTagInput" maxlength="10" autocomplete="off" placeholder="ID / Tag (Any)" style="flex:1 1 90px;min-width:80px;" class="mono" onkeydown="if(event.key==='Enter')createNewPilotAccount()">
+                                <button type="button" class="btn btn-emerald active" style="flex:0 0 auto;" onclick="createNewPilotAccount()">Create</button>
+                            </div>
+
+                            <div id="authLoginPane" class="stack-xs hidden">
+                                <div class="row-wrap">
+                                    <input type="text" id="loginUidInput" maxlength="24" inputmode="numeric" autocomplete="off" placeholder="Enter Unique 17-Digit UID" class="mono" style="flex:1 1 155px;min-width:135px;letter-spacing:0.06em;" onkeydown="if(event.key==='Enter')signInWithUid()">
+                                    <button type="button" class="btn btn-sky active" style="flex:0 0 auto;" onclick="signInWithUid()">Sign In</button>
+                                </div>
+                            </div>
+
+                            <div id="authFeedback" class="hidden mono auth-feedback"></div>
+                        </div>
+
+                        <!-- Signed-Out Lock Banner -->
+                        <div id="menuLockedHint" class="recessed-well mono menu-lock-hint">
+                            🔒 Create a pilot or sign in with a 17-digit UID to unlock Play, Garage, Ranks, Mail &amp; Settings.
+                        </div>
+                    </div>
+
+                    <!-- RIGHT COLUMN: SEASON + STATS + LOADOUT TELEMETRY -->
+                    <div class="menu-col stack-sm">
+                        <div class="recessed-well row-between mono menu-season-strip">
+                            <span id="menuSeasonStatusText" style="color:#fcd34d;font-weight:700;">SEASON 1</span>
+                            <span>👑 #1: <strong id="menuTopLeaderName" style="color:#fcd34d;">Unclaimed</strong> <span id="menuTopLeaderScore" style="color:#34d399;"></span></span>
+                        </div>
+
+                        <div class="grid-2 mono menu-stats-grid">
+                            <div class="recessed-well stat-tile">
+                                <div class="stat-k">SEASON BEST</div>
+                                <div id="menuStatSeasonBest" class="stat-v" style="color:#fcd34d;">0</div>
+                            </div>
+                            <div class="recessed-well stat-tile">
+                                <div class="stat-k">ALL-TIME BEST</div>
+                                <div id="menuStatAllBest" class="stat-v" style="color:#34d399;">0</div>
+                            </div>
+                            <div class="recessed-well stat-tile">
+                                <div class="stat-k">MAX EPOCH</div>
+                                <div id="menuStatBestEpoch" class="stat-v" style="color:#7dd3fc;">Ep 1</div>
+                            </div>
+                            <div class="recessed-well stat-tile">
+                                <div class="stat-k">PHANTOM FLASHES</div>
+                                <div id="menuStatFlashes" class="stat-v" style="color:#c084fc;">0</div>
+                            </div>
+                        </div>
+
+                        <div class="recessed-well row-between mono menu-loadout-strip">
+                            <span class="truncate">⚙️ DIFF: <strong id="menuQuickDiff" style="color:#34d399;">Easy</strong></span>
+                            <span style="color:#334155;">|</span>
+                            <span class="truncate">🌍 <strong id="menuQuickBiome" style="color:#7dd3fc;">Cyber Void</strong></span>
+                            <span style="color:#334155;">|</span>
+                            <span class="truncate">🎨 <strong id="menuQuickSkin" style="color:#fcd34d;">Standard</strong></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- BOTTOM ACTION DOCK (Locked When Signed Out) -->
+            <div class="menu-action-dock">
+                <button type="button" id="engageLaunchBtn" class="btn btn-launch menu-play-btn" onclick="startGameSession()">▶ PLAY</button>
+                <div class="menu-secondary-actions">
+                    <button type="button" id="menuMailBtn" class="btn btn-sky menu-dock-btn" onclick="openInboxModal()">📬 Mail <span id="menuInboxBadge" class="badge badge-red mono hidden" style="padding:1px 5px;font-size:9px;">0</span></button>
+                    <button type="button" id="menuRanksBtn" class="btn btn-amber menu-dock-btn" onclick="openLeaderboardModal()">🏆 Ranks</button>
+                    <button type="button" id="menuGarageBtn" class="btn menu-dock-btn" onclick="openSettingsModal('garage')">🎨 Garage</button>
+                    <button type="button" id="menuSettingsBtn" class="btn menu-dock-btn" onclick="openSettingsModal('game')">⚙️ Settings</button>
+                    <button type="button" id="menuExitBtn" class="btn btn-danger menu-dock-btn" onclick="exitGamePortal()">🚪 Exit</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- GAME OVER -->
+    <div id="gameOverModal" class="modal-backdrop" style="z-index:55;">
+        <div class="hardware-panel modal-card gameover-card">
+            <div class="row-center"><span class="badge badge-red mono">HULL 0%</span></div>
+            <h2 class="title-cinzel" style="font-size:clamp(15px,3vmin,20px);color:#fff;">RUN COMPLETE</h2>
+            <div id="gameOverSeasonNote" class="mono" style="font-size:10px;color:var(--text-muted);"></div>
+            <div class="grid-2 mono" style="text-align:left;">
+                <div class="recessed-well" style="padding:8px 10px;"><div style="font-size:9px;color:var(--text-dim);">SCORE</div><div id="finalScoreVal" style="font-size:16px;font-weight:800;color:#34d399;">0</div></div>
+                <div class="recessed-well" style="padding:8px 10px;"><div style="font-size:9px;color:var(--text-dim);">BEST</div><div id="finalBestVal" style="font-size:12px;font-weight:800;color:#fcd34d;margin-top:2px;">0</div></div>
+                <div class="recessed-well" style="padding:8px 10px;"><div style="font-size:9px;color:var(--text-dim);">EPOCH</div><div id="finalEpochVal" class="truncate" style="font-size:11.5px;font-weight:700;color:#7dd3fc;margin-top:2px;">Ep 1</div></div>
+                <div class="recessed-well" style="padding:8px 10px;"><div style="font-size:9px;color:var(--text-dim);">FLASHES</div><div id="finalNearMissVal" style="font-size:14px;font-weight:800;color:#c084fc;margin-top:2px;">0</div></div>
+            </div>
+            <div class="row-wrap" style="justify-content:center;">
+                <button type="button" class="btn btn-launch" style="flex:1 1 110px;padding:9px;" onclick="startGameSession()">↻ Retry</button>
+                <button type="button" class="btn btn-amber" style="padding:9px 11px;" onclick="openLeaderboardModal()">🏆 Ranks</button>
+                <button type="button" class="btn" style="padding:9px 11px;" onclick="openSettingsModal('garage')">🎨 Garage</button>
+                <button type="button" class="btn" style="padding:9px 11px;" onclick="returnToMainMenu()">Menu</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- INBOX -->
+    <div id="inboxModal" class="modal-backdrop" style="z-index:72;">
+        <div class="hardware-panel modal-card" style="max-width:640px;">
+            <div class="modal-header">
+                <div class="row">
+                    <h2 style="font-size:13px;font-weight:800;letter-spacing:0.04em;">📬 INBOX</h2>
+                    <span id="inboxUnreadCountBadge" class="badge badge-sky mono">0</span>
+                </div>
+                <div class="row-wrap">
+                    <button type="button" class="btn btn-xs" onclick="markAllInboxRead()">✓ Read All</button>
+                    <button type="button" class="btn btn-xs btn-danger" onclick="clearReadInboxMail()">Clear Read</button>
+                    <button type="button" class="btn btn-sm" onclick="closeInboxModal()">← Back</button>
+                </div>
+            </div>
+            <div id="inboxListContainer" class="modal-body modal-scroll stack-xs"></div>
+        </div>
+    </div>
+
+    <!-- LEADERBOARD (Pure Rankings) -->
+    <div id="leaderboardModal" class="modal-backdrop" style="z-index:75;">
+        <div class="hardware-panel modal-card" style="max-width:660px;">
+            <div class="modal-header">
+                <div>
+                    <h2 style="font-size:13px;font-weight:800;letter-spacing:0.04em;">🏆 LEADERBOARD</h2>
+                    <div id="lbSeasonHeaderSub" class="mono" style="font-size:10px;color:#fcd34d;margin-top:2px;">Season 1</div>
+                </div>
+                <div class="row-wrap">
+                    <button type="button" id="lbDevManageBtn" class="btn btn-xs btn-sky hidden" onclick="toggleLbDevManage()">🛠️ Manage</button>
+                    <button type="button" class="btn btn-sm" onclick="closeLeaderboardModal()">← Back</button>
+                </div>
+            </div>
+            <div class="tab-bar" style="padding:6px 12px;">
+                <button type="button" id="lbTabSeason" class="tab-btn active" onclick="switchLeaderboardTab('season')">🔥 Season</button>
+                <button type="button" id="lbTabAllTime" class="tab-btn" onclick="switchLeaderboardTab('alltime')">🏛️ All-Time</button>
+            </div>
+            <div id="leaderboardListContainer" class="modal-body modal-scroll stack-xs"></div>
+        </div>
+    </div>
+
+    <!-- PAUSE / SETTINGS HUB -->
+    <div id="pauseSettingsModal" class="modal-backdrop" style="z-index:65;">
+        <div class="hardware-panel modal-card" style="max-width:780px;">
+            <div class="modal-header">
+                <div class="row">
+                    <span style="width:8px;height:8px;border-radius:50%;background:#38bdf8;"></span>
+                    <h2 id="settingsModalTitle" style="font-size:13px;font-weight:800;letter-spacing:0.04em;">SETTINGS</h2>
+                </div>
+                <div class="row-wrap" style="justify-content:flex-end;">
+                    <button type="button" id="inGameRestartBtn" class="btn btn-xs btn-amber hidden" onclick="startGameSession()">↻ Restart</button>
+                    <button type="button" id="inGameMenuBtn" class="btn btn-xs btn-danger hidden" onclick="returnToMainMenu()">Main Menu</button>
+                    <button type="button" class="btn btn-xs btn-sky" onclick="openInboxModal()">📬 Mail</button>
+                    <button type="button" id="resumeOrCloseSettingsBtn" class="btn btn-sm btn-emerald active" onclick="resumeFromSettings()">← Back</button>
+                </div>
+            </div>
+
+            <div class="tab-bar">
+                <button type="button" id="setTabBtn_game" class="tab-btn active" onclick="switchSettingsTab('game')">Game</button>
+                <button type="button" id="setTabBtn_garage" class="tab-btn" onclick="switchSettingsTab('garage')">Garage</button>
+                <button type="button" id="setTabBtn_profile" class="tab-btn" onclick="switchSettingsTab('profile')">Profile</button>
+                <button type="button" id="setTabBtn_sounds" class="tab-btn" onclick="switchSettingsTab('sounds')">Audio</button>
+                <button type="button" id="setTabBtn_controls" class="tab-btn" onclick="switchSettingsTab('controls')">Controls</button>
+                <button type="button" id="setTabBtn_graphics" class="tab-btn" onclick="switchSettingsTab('graphics')">Graphics</button>
+                <button type="button" id="setTabBtn_dev" class="tab-btn hidden" onclick="switchSettingsTab('dev')" style="color:#67e8f9;">Dev</button>
+            </div>
+
+            <div class="modal-body modal-scroll stack-sm">
+                <!-- GAME -->
+                <div id="setTab_game" class="stack-sm">
+                    <div class="row-between">
+                        <span class="mono" style="font-size:10px;color:var(--text-muted);font-weight:700;">DIFFICULTY &amp; DIMENSIONS</span>
+                        <button type="button" class="btn btn-xs btn-sky" onclick="resetGameSettingsOnly()">↺ Reset</button>
+                    </div>
+                    <div class="recessed-well stack-xs" style="padding:9px 11px;">
+                        <div class="row-between">
+                            <span class="mono" style="font-size:11px;font-weight:700;">DIFFICULTY</span>
+                            <span id="diffCurrentLabel" class="mono" style="font-size:10px;color:#34d399;font-weight:700;">Easy</span>
+                        </div>
+                        <div class="grid-4">
+                            <button type="button" id="diffBtn_easy" class="btn btn-sm" onclick="setDifficulty('easy')">Easy (1.0x)</button>
+                            <button type="button" id="diffBtn_normal" class="btn btn-sm" onclick="setDifficulty('normal')">Normal (1.2x)</button>
+                            <button type="button" id="diffBtn_hard" class="btn btn-sm" onclick="setDifficulty('hard')">Hard (1.5x)</button>
+                            <button type="button" id="diffBtn_void" class="btn btn-sm" onclick="setDifficulty('void')">Void (2.0x)</button>
+                        </div>
+                    </div>
+                    <div class="recessed-well stack-xs" style="padding:9px 11px;">
+                        <div class="row-between" style="flex-wrap:wrap;">
+                            <span class="mono" style="font-size:11px;font-weight:700;">DIMENSIONS</span>
+                            <button type="button" id="autoBiomeToggleBtn" class="btn btn-xs btn-emerald" onclick="toggleAutoBiomeCycle()">Auto-Cycle: ON</button>
+                        </div>
+                        <div id="biomeGridSelector" class="grid-3"></div>
+                    </div>
+                </div>
+
+                <!-- GARAGE -->
+                <div id="setTab_garage" class="stack-sm hidden">
+                    <div class="row-between" style="flex-wrap:wrap;">
+                        <span class="mono" style="font-size:10px;color:var(--text-muted);font-weight:700;">VEHICLE CUSTOMIZER (LIVE VIBRATION &amp; ORBITAL RING)</span>
+                        <div class="row-wrap">
+                            <button type="button" id="garageNitroPreviewBtn" class="btn btn-xs btn-amber" onclick="toggleGarageNitroPreview()">🔥 Nitro: ON</button>
+                            <button type="button" class="btn btn-xs btn-sky" onclick="triggerGarageEmpPreview()">⚡ Test EMP</button>
+                            <button type="button" class="btn btn-xs" onclick="resetVehicleCustomization()">↺ Reset</button>
+                        </div>
+                    </div>
+
+                    <div class="recessed-well garage-stage">
+                        <canvas id="garagePreviewCanvas" width="560" height="184" class="garage-canvas"></canvas>
+                        <div class="row-wrap" style="justify-content:center;">
+                            <button type="button" class="btn btn-xs" onclick="applyGaragePreset('steel')">Steel</button>
+                            <button type="button" class="btn btn-xs" onclick="applyGaragePreset('cobalt')">Cobalt</button>
+                            <button type="button" class="btn btn-xs" onclick="applyGaragePreset('crimson')">Crimson</button>
+                            <button type="button" class="btn btn-xs" onclick="applyGaragePreset('emerald')">Emerald</button>
+                            <button type="button" class="btn btn-xs" onclick="applyGaragePreset('solar')">Solar</button>
+                            <button type="button" class="btn btn-xs" onclick="applyGaragePreset('amethyst')">Amethyst</button>
+                        </div>
+                    </div>
+
+                    <div class="grid-2">
+                        <div class="recessed-well stack-xs" style="padding:8px 10px;">
+                            <div class="row-between"><span class="mono" style="font-size:10px;font-weight:700;">BODY PAINT</span><input type="color" id="custColor_bodyPrimary" oninput="setCustomVehicleColor('bodyPrimary',this.value)"></div>
+                            <div id="swatch_bodyPrimary" class="swatch-row"></div>
+                        </div>
+                        <div class="recessed-well stack-xs" style="padding:8px 10px;">
+                            <div class="row-between"><span class="mono" style="font-size:10px;font-weight:700;">TRIM &amp; AERO</span><input type="color" id="custColor_bodySecondary" oninput="setCustomVehicleColor('bodySecondary',this.value)"></div>
+                            <div id="swatch_bodySecondary" class="swatch-row"></div>
+                        </div>
+                        <div class="recessed-well stack-xs" style="padding:8px 10px;">
+                            <div class="row-between"><span class="mono" style="font-size:10px;font-weight:700;">CANOPY GLASS</span><input type="color" id="custColor_canopyColor" oninput="setCustomVehicleColor('canopyColor',this.value)"></div>
+                            <div id="swatch_canopyColor" class="swatch-row"></div>
+                        </div>
+                        <div class="recessed-well stack-xs" style="padding:8px 10px;">
+                            <div class="row-between"><span class="mono" style="font-size:10px;font-weight:700;">EMP &amp; LANE RAIL</span><input type="color" id="custColor_empColor" oninput="setCustomVehicleColor('empColor',this.value)"></div>
+                            <div id="swatch_empColor" class="swatch-row"></div>
+                        </div>
+                    </div>
+
+                    <div class="recessed-well stack-xs" style="padding:8px 10px;">
+                        <div class="row-between"><span class="mono" style="font-size:10px;font-weight:700;">BASE NITRO &amp; UNDER-RING COLOR</span><input type="color" id="custColor_boostColor" oninput="setCustomVehicleColor('boostColor',this.value)"></div>
+                        <div id="swatch_boostColor" class="swatch-row"></div>
+                    </div>
+
+                    <div class="recessed-well stack-xs" style="padding:9px 11px;">
+                        <div class="row-between" style="flex-wrap:wrap;">
+                            <span class="mono" style="font-size:10.5px;font-weight:700;">ALL-IN-ONE CHROMA &amp; FX SKINS</span>
+                            <span id="nitroSkinAccessHint" class="mono" style="font-size:9.5px;color:#fcd34d;">All-Time #1 &amp; Season Top 5</span>
+                        </div>
+                        <div id="nitroSkinSelectorGrid" class="grid-2"></div>
+                    </div>
+                </div>
+
+                <!-- PROFILE -->
+                <div id="setTab_profile" class="stack-sm hidden">
+                    <div class="recessed-well stack-sm" style="padding:11px 13px;">
+                        <div class="row-between" style="flex-wrap:wrap;">
+                            <div class="row-wrap">
+                                <strong id="profNameDisplay" style="font-size:15px;color:#fff;">Pilot</strong>
+                                <button type="button" id="profTagRevealBtn" class="reveal-pill" onclick="toggleRevealField('profTag')" title="Click to reveal ID">ID: #•••• 👁</button>
+                                <span id="profRoleDisplay" class="badge mono">PILOT</span>
+                            </div>
+                            <button type="button" class="btn btn-xs btn-danger" onclick="logoutFromProfile()">⏻ Logout</button>
+                        </div>
+
+                        <div class="recessed-well" style="padding:9px 11px;background:#07090e;border-color:rgba(56,189,248,0.32);">
+                            <div class="row-between" style="flex-wrap:wrap;gap:6px;">
+                                <div>
+                                    <div class="mono" style="font-size:9px;color:#7dd3fc;font-weight:700;">UNIQUE 17-DIGIT UID (CLICK TO REVEAL)</div>
+                                    <button type="button" id="profUidRevealBtn" class="reveal-pill" style="margin-top:5px;font-size:13px;padding:4px 10px;" onclick="toggleRevealField('profUid')">•••• •••• •••• ••••• 👁</button>
+                                </div>
+                                <button type="button" id="copyUidBtn" class="btn btn-xs btn-emerald hidden" onclick="copyCurrentAccountUid('copyUidBtn')">📋 Copy UID</button>
+                            </div>
+                        </div>
+
+                        <div class="recessed-well stack-xs" style="padding:8px 10px;">
+                            <div class="mono" style="font-size:9.5px;color:var(--text-muted);font-weight:700;">UPDATE NAME &amp; ID (NO RESTRICTIONS)</div>
+                            <div class="row-wrap">
+                                <input type="text" id="profEditNameInput" maxlength="28" autocomplete="off" placeholder="New Name" style="flex:2 1 120px;">
+                                <input type="text" id="profEditTagInput" maxlength="10" autocomplete="off" placeholder="New ID" class="mono" style="flex:1 1 95px;">
+                                <button type="button" class="btn btn-xs btn-sky active" onclick="saveProfileIdentity()">Save</button>
+                            </div>
+                        </div>
+
+                        <div class="grid-3 mono">
+                            <div class="recessed-well" style="padding:7px 9px;"><div style="font-size:8.5px;color:var(--text-dim);">CREATED</div><div id="profCreatedDisplay" style="font-size:11px;margin-top:2px;">-</div></div>
+                            <div class="recessed-well" style="padding:7px 9px;"><div style="font-size:8.5px;color:var(--text-dim);">ACTIVE SKINS</div><div id="profRewardsDisplay" class="truncate" style="font-size:11px;color:#fcd34d;margin-top:2px;">None</div></div>
+                            <div class="recessed-well" style="padding:7px 9px;"><div style="font-size:8.5px;color:var(--text-dim);">RUNS</div><div id="profRunsDisplay" style="font-size:11px;color:#34d399;margin-top:2px;">0</div></div>
+                        </div>
+
+                        <div id="profDeleteSection" class="row-between" style="padding-top:8px;border-top:1px solid #1b202b;flex-wrap:wrap;">
+                            <div>
+                                <div style="font-size:11.5px;font-weight:700;color:#fca5a5;">Delete Account</div>
+                                <div style="font-size:10px;color:var(--text-dim);">Permanently deletes your account, scores &amp; releases UID across all browsers.</div>
+                            </div>
+                            <button type="button" class="btn btn-xs btn-danger" onclick="deleteActiveAccountSelf()">🗑️ Delete Account</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- AUDIO -->
+                <div id="setTab_sounds" class="stack-sm hidden">
+                    <div class="row-between">
+                        <span class="mono" style="font-size:10px;color:var(--text-muted);font-weight:700;">AUDIO MIXER</span>
+                        <button type="button" class="btn btn-xs btn-sky" onclick="resetSoundSettingsOnly()">↺ Reset</button>
+                    </div>
+                    <div class="recessed-well stack-xs" style="padding:9px 11px;">
+                        <div class="row-between">
+                            <span class="mono" style="font-size:10.5px;font-weight:700;">SOUNDTRACK</span>
+                            <span id="ostLockStatus" class="mono" style="font-size:10px;color:#7dd3fc;">Cyber-Synth</span>
+                        </div>
+                        <div id="ostButtonsGrid" class="grid-3">
+                            <button type="button" id="ostBtn_synth" class="recessed-well" style="padding:8px;text-align:left;cursor:pointer;" onclick="selectOstMode('synth')">
+                                <div style="font-weight:700;font-size:11.5px;color:#fff;">🎹 Cyber-Synth</div>
+                                <div style="font-size:9.5px;color:var(--text-muted);">128 BPM</div>
+                            </button>
+                            <button type="button" id="ostBtn_mitadru" class="recessed-well" style="padding:8px;text-align:left;cursor:pointer;" onclick="selectOstMode('mitadru')">
+                                <div class="row-between"><span style="font-weight:700;font-size:11.5px;color:#fff;">🎧 Mixtape</span><span class="badge badge-cyan mono" style="font-size:8px;">DEV</span></div>
+                                <div style="font-size:9.5px;color:var(--text-muted);">Mitadru.m4a</div>
+                            </button>
+                            <button type="button" id="ostBtn_custom" class="recessed-well" style="padding:8px;text-align:left;cursor:pointer;" onclick="selectOstMode('custom')">
+                                <div style="font-weight:700;font-size:11.5px;color:#fff;" class="truncate">📂 Custom</div>
+                                <div id="customOstBtnSub" style="font-size:9.5px;color:var(--text-muted);" class="truncate">None</div>
+                            </button>
+                        </div>
+                        <div class="row-between" style="padding-top:6px;border-top:1px solid #1b202b;flex-wrap:wrap;">
+                            <span id="customSongStatusText" class="mono truncate" style="font-size:10px;color:var(--text-muted);max-width:280px;">Custom Track (&le; 20 MB)</span>
+                            <div class="row-wrap">
+                                <input type="file" id="customSongFileInput" accept="audio/*,*/*" class="hidden" onchange="handleCustomSongUpload(this.files)">
+                                <button type="button" class="btn btn-xs btn-emerald" onclick="document.getElementById('customSongFileInput').click()">📤 Upload</button>
+                                <button type="button" id="removeMyCustomSongBtn" class="btn btn-xs btn-danger hidden" onclick="removeCurrentPilotCustomSong()">✕</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="volumeSlidersGrid" class="recessed-well grid-2 mono" style="padding:9px 11px;row-gap:8px;column-gap:14px;"></div>
+                </div>
+
+                <!-- CONTROLS (PC shows Keyboard Controls; Mobile shows Mobile Controls) -->
+                <div id="setTab_controls" class="stack-sm hidden">
+                    <div class="row-between" style="flex-wrap:wrap;">
+                        <span id="ctrlPlatformHeaderLabel" class="mono" style="font-size:10px;color:var(--text-muted);font-weight:700;">CONTROLS</span>
+                        <button type="button" class="btn btn-xs btn-sky" onclick="resetControlSettingsOnly()">↺ Reset</button>
+                    </div>
+
+                    <!-- Mobile Controls (Shown on Mobile Devices Only) -->
+                    <div class="mobile-only recessed-well stack-xs" style="padding:9px 11px;">
+                        <div class="grid-3">
+                            <button type="button" id="mobCtrl_buttons" class="btn btn-sm" onclick="setMobileControlMode('buttons')">◀▶ Paddles</button>
+                            <button type="button" id="mobCtrl_drag" class="btn btn-sm" onclick="setMobileControlMode('drag')">👆 Tap Lane</button>
+                            <button type="button" id="mobCtrl_tilt" class="btn btn-sm" onclick="setMobileControlMode('tilt')">📲 Gyro</button>
+                        </div>
+                        <div id="gyroCalibrationBox" class="recessed-well stack-xs" style="padding:8px 10px;opacity:0.4;pointer-events:none;">
+                            <div class="row-between" style="flex-wrap:wrap;">
+                                <div class="row"><span class="mono" style="font-size:10px;color:var(--text-muted);">ANGLE</span><span id="gyroLiveAngleLabel" class="badge badge-sky mono">0.0°</span></div>
+                                <div class="row-wrap">
+                                    <button type="button" id="invertGyroBtn" class="btn btn-xs" onclick="toggleInvertGyro()">Flip: OFF</button>
+                                    <button type="button" class="btn btn-xs btn-sky active" onclick="calibrateTiltSensor(false)">Center</button>
+                                </div>
+                            </div>
+                            <div class="mono">
+                                <div class="row-between" style="font-size:10px;"><span style="color:var(--text-muted);">Sensitivity</span><span id="gyroSpeedLabel" style="color:#7dd3fc;">65%</span></div>
+                                <input type="range" id="gyroSpeedSlider" min="20" max="100" value="65" oninput="updateGyroSpeedSetting(this.value)">
+                            </div>
+                        </div>
+                        <div class="row-between" style="padding-top:5px;border-top:1px solid #1b202b;flex-wrap:wrap;">
+                            <span style="font-size:11px;color:var(--text-muted);">Double-Tap Road for Nitro</span>
+                            <button type="button" id="doubleTapNitroBtn" class="btn btn-xs btn-emerald" onclick="toggleDoubleTapNitro()">ON</button>
+                        </div>
+                    </div>
+
+                    <!-- PC / Laptop Keyboard Keybinds (Shown on PC & Laptops Only) -->
+                    <div class="pc-only recessed-well stack-xs" style="padding:9px 11px;">
+                        <div class="row-between" style="flex-wrap:wrap;">
+                            <span class="mono" style="font-size:10.5px;font-weight:700;">KEYBOARD KEYBINDS</span>
+                            <span class="mono" style="font-size:9.5px;color:var(--text-dim);">Click any action to rebind &bull; ESC = Pause</span>
+                        </div>
+                        <div id="pcKeybindGrid" class="grid-3 mono"></div>
+                    </div>
+                </div>
+
+                <!-- GRAPHICS -->
+                <div id="setTab_graphics" class="stack-sm hidden">
+                    <div class="row-between">
+                        <span class="mono" style="font-size:10px;color:#34d399;font-weight:700;">GRAPHICS &amp; OPTICS</span>
+                        <button type="button" class="btn btn-xs btn-sky" onclick="resetGraphicsSettingsOnly()">↺ Reset</button>
+                    </div>
+                    <div class="recessed-well stack-xs" style="padding:9px 11px;">
+                        <div class="row-between">
+                            <span class="mono" style="font-size:10.5px;font-weight:700;">PRESET</span>
+                            <span id="gfxPresetActiveLabel" class="mono" style="font-size:10px;color:#7dd3fc;font-weight:700;">MEDIUM</span>
+                        </div>
+                        <div id="gfxPresetButtonsGrid" class="grid-4"></div>
+                    </div>
+                    <div class="recessed-well stack-xs mono" style="padding:9px 11px;">
+                        <div class="grid-3">
+                            <div>
+                                <div class="row-between" style="font-size:10px;"><span style="color:var(--text-muted);">Scale</span><span id="gfxResLabel" style="color:#34d399;">1.00x</span></div>
+                                <input type="range" id="gfxResSlider" min="60" max="150" step="5" value="100" oninput="updateGfxResolution(this.value)">
+                            </div>
+                            <div>
+                                <div class="row-between" style="font-size:10px;"><span style="color:var(--text-muted);">Distance</span><span id="gfxSlicesLabel" style="color:#7dd3fc;">26 Seg</span></div>
+                                <input type="range" id="gfxSlicesSlider" min="16" max="48" step="2" value="26" oninput="updateGfxDrawSlices(this.value)">
+                            </div>
+                            <div>
+                                <div class="row-between" style="font-size:10px;"><span style="color:var(--text-muted);">Weather</span><span id="gfxParticleLabel" style="color:#c084fc;">65%</span></div>
+                                <input type="range" id="gfxParticleSlider" min="0" max="150" step="1" value="65" oninput="updateGfxParticles(this.value)">
+                            </div>
+                        </div>
+                        <div id="gfxTogglesGrid" class="grid-3" style="padding-top:4px;"></div>
+                    </div>
+                    <div class="recessed-well stack-xs" style="padding:9px 11px;">
+                        <div class="row-between">
+                            <span class="mono" style="font-size:10.5px;font-weight:700;">COLOR GRADE</span>
+                            <button type="button" id="deactivateOpticFilterBtn" class="btn btn-xs btn-danger hidden" onclick="setVisualFilter('filter-standard')">✕ Clear</button>
+                        </div>
+                        <div id="gfxFilterButtonsGrid" class="grid-4"></div>
+                    </div>
+                </div>
+
+                <!-- DEV CONSOLE -->
+                <div id="setTab_dev" class="stack-sm hidden">
+                    <div class="recessed-well stack-sm" style="padding:11px;border-color:rgba(0,245,212,0.4);">
+                        <div class="row-between" style="border-bottom:1px solid #1b202b;padding-bottom:7px;flex-wrap:wrap;">
+                            <span class="mono" style="font-size:11px;font-weight:800;color:#67e8f9;">DEV CONSOLE // REALTIME DB</span>
+                            <div class="row-wrap">
+                                <span id="devRtBadge" class="badge badge-amber mono">🟡 SYNC</span>
+                                <button type="button" class="btn btn-xs btn-sky" onclick="forceManualCloudSync()">↻ Sync Now</button>
+                            </div>
+                        </div>
+
+                        <div class="row-between recessed-well" style="padding:7px 9px;flex-wrap:wrap;">
+                            <span class="mono" style="font-size:10.5px;font-weight:700;">WARP EPOCH</span>
+                            <div class="row">
+                                <input type="number" id="devEpochInput" min="1" max="99999" value="250" class="mono" style="width:80px;text-align:center;">
+                                <button type="button" class="btn btn-xs btn-sky active" onclick="devStartAtCustomEpoch()">▶ Warp</button>
+                            </div>
+                        </div>
+
+                        <div class="grid-3">
+                            <button type="button" id="devGodModeBtn" class="btn btn-xs btn-sky" onclick="toggleDevGodMode()">God Mode: OFF</button>
+                            <button type="button" class="btn btn-xs btn-amber" onclick="devFastForwardSeasonPhase()">⏩ Next Season Phase</button>
+                            <button type="button" class="btn btn-xs btn-danger" onclick="devRemoveAllCustomSongs()">Clear All Songs</button>
+                        </div>
+
+                        <div class="grid-2">
+                            <button type="button" class="btn btn-xs btn-danger" onclick="devResetAllScores()">↺ Reset ALL Scores</button>
+                            <button type="button" class="btn btn-xs btn-danger" onclick="devDeleteAllNonDevAccounts()">🗑️ Delete ALL Player Accounts</button>
+                        </div>
+
+                        <div class="recessed-well stack-xs" style="padding:8px 9px;">
+                            <div class="mono" style="font-size:10px;font-weight:700;color:#7dd3fc;">BROADCAST MAIL (ALL BROWSERS)</div>
+                            <div class="row-wrap">
+                                <input type="text" id="devMailTitleInput" placeholder="Subject" style="flex:1 1 120px;">
+                                <input type="text" id="devMailBodyInput" placeholder="Message..." style="flex:2 1 160px;">
+                                <button type="button" class="btn btn-xs btn-emerald active" onclick="devBroadcastSystemMail()">Send</button>
+                            </div>
+                        </div>
+
+                        <div class="recessed-well stack-xs" style="padding:8px 9px;">
+                            <div class="row-between" style="flex-wrap:wrap;gap:6px;">
+                                <div class="row">
+                                    <span class="mono" style="font-size:10px;font-weight:700;color:#cbd5e1;">ACCOUNTS &amp; SCORES (LIVE)</span>
+                                    <span id="devAccCountBadge" class="badge mono">0</span>
+                                </div>
+                                <div class="row-wrap">
+                                    <input type="text" id="devAccSearchInput" placeholder="Filter name / ID / UID" style="width:145px;padding:3px 7px;font-size:10px;" oninput="renderDevAccountsList()">
+                                    <button type="button" id="devRevealAllIdsBtn" class="btn btn-xs" onclick="toggleDevRevealAllIds()">👁 Show All IDs</button>
+                                </div>
+                            </div>
+                            <div id="devAccountsList" class="stack-xs modal-scroll" style="max-height:165px;"></div>
+                        </div>
+
+                        <div class="recessed-well stack-xs" style="padding:8px 9px;">
+                            <div class="mono" style="font-size:10px;font-weight:700;color:#cbd5e1;">CUSTOM SONGS (INDEXEDDB)</div>
+                            <div id="devCustomSongsList" class="stack-xs" style="font-size:10px;color:var(--text-muted);"></div>
+                        </div>
+
+                        <div id="devConsoleFeedback" class="hidden mono badge-cyan" style="padding:5px 9px;border-radius:7px;font-size:10px;"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- AAA IN-GAME CONFIRMATION MODAL -->
+    <div id="confirmModal" class="modal-backdrop" style="z-index:110;">
+        <div class="hardware-panel modal-card" style="max-width:380px;padding:16px;gap:12px;border-color:rgba(239,68,68,0.45);">
+            <div class="row-between">
+                <strong id="confirmModalTitle" style="font-size:13.5px;color:#fff;">Confirm Action</strong>
+                <span class="badge badge-red mono">CONFIRM</span>
+            </div>
+            <div id="confirmModalBody" style="font-size:12px;color:#cbd5e1;line-height:1.45;white-space:pre-line;"></div>
+            <div class="row" style="justify-content:flex-end;">
+                <button type="button" class="btn btn-sm" onclick="resolveConfirmModal(false)">Cancel</button>
+                <button type="button" id="confirmModalOkBtn" class="btn btn-sm btn-danger" onclick="resolveConfirmModal(true)">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- HUD HEADER -->
+    <header class="hud-header">
+        <div class="hud-wrap">
+            <div class="hud-collapsible hardware-panel hud-pill">
+                <div class="row" style="gap:5px;">
+                    <span id="hudPilotDot" style="width:8px;height:8px;border-radius:50%;background:#34d399;flex-shrink:0;"></span>
+                    <span id="hudPilotCallsign" class="truncate" style="font-size:clamp(9.5px,1.15vmin,11px);font-weight:700;max-width:95px;">PILOT</span>
+                </div>
+                <span class="hud-chip mono"><strong id="hudScore" style="color:#34d399;">000000</strong></span>
+                <span class="hud-chip mono" id="hudEpoch" style="color:#7dd3fc;font-weight:700;">EP 1</span>
+                <span class="hud-chip mono" id="hudCombo" style="color:#fcd34d;font-weight:700;">1.0x</span>
+                <div class="hud-chip row" style="gap:4px;">
+                    <span class="mono hide-sm" style="font-size:8.5px;color:var(--text-muted);">HULL</span>
+                    <div class="hull-track"><div id="hudArmorBar" class="hull-fill" style="width:100%;"></div></div>
+                    <span id="hudArmorPct" class="mono" style="font-size:9.5px;font-weight:700;color:#34d399;">100%</span>
+                </div>
+            </div>
+
+            <div class="hud-collapsible hardware-panel hud-pill mono hud-center-pill">
+                <span id="hudBiomeName" class="truncate" style="color:#7dd3fc;font-weight:700;max-width:130px;">🌌 Cyber Void</span>
+                <span style="color:#334155;">|</span>
+                <span id="hudWarningBadge" class="badge badge-emerald" style="font-size:9px;">CLEAR</span>
+                <span class="hide-md" style="color:#334155;">|</span>
+                <span class="hide-md truncate" style="color:#fcd34d;max-width:140px;">👑 <strong id="hudLeaderMini">Unclaimed</strong></span>
+            </div>
+
+            <!-- PC / Laptop Right HUD Pill vs. Mobile Right HUD Pill -->
+            <div class="row" style="pointer-events:auto;">
+                <div class="pc-only hud-collapsible hardware-panel hud-pill">
+                    <div class="hud-chip row" style="gap:5px;">
+                        <div class="eq-wrap"><span class="eq-bar eq-1 eq-paused"></span><span class="eq-bar eq-2 eq-paused"></span><span class="eq-bar eq-3 eq-paused"></span></div>
+                        <span id="hudOstShortLabel" class="mono" style="font-size:9px;color:#cbd5e1;">SYNTH</span>
+                    </div>
+                    <span id="pcHideUiHintBadge" class="hud-chip mono" style="font-size:9.5px;color:var(--text-muted);">[H] UI &bull; [ESC] Pause</span>
+                </div>
+                <div id="mobileTopRightPill" class="mobile-only hardware-panel hud-pill" style="padding:3.5px 5px;">
+                    <button type="button" id="mobilePauseBtn" class="btn btn-xs btn-sky" onclick="openSettingsModal('game')">⏸</button>
+                    <button type="button" id="mobileHideUiBtn" class="btn btn-xs" onclick="toggleGameHudVisibility()">👁️</button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- LEFT RADAR & METERS -->
+    <div class="hud-collapsible hud-left-dock">
+        <div class="hardware-panel radar-panel">
+            <div class="row-between mono" style="width:100%;font-size:8px;">
+                <span style="color:var(--text-muted);font-weight:700;">RADAR</span>
+                <span id="hudSpeedKmh" style="color:#34d399;font-weight:700;">90 km/h</span>
+            </div>
+            <div class="recessed-well radar-well">
+                <canvas id="miniRadarCanvas" width="80" height="80" style="width:100%;height:100%;display:block;"></canvas>
+            </div>
+        </div>
+        <div class="hardware-panel meter-panel mono">
+            <div>
+                <div class="meter-head" style="color:#fcd34d;"><span>🔥 NITRO</span><span id="hudNitroPct">100%</span></div>
+                <div class="meter-track"><div id="hudNitroBar" style="height:100%;background:#fbbf24;width:100%;"></div></div>
+            </div>
+            <div>
+                <div class="meter-head" style="color:#7dd3fc;"><span>⚡ EMP</span><span id="hudEmpPct">READY!</span></div>
+                <div class="meter-track"><div id="hudEmpBar" style="height:100%;background:#38bdf8;width:100%;"></div></div>
+            </div>
+            <button type="button" id="hudDevRefillBtn" class="btn btn-xs btn-sky hidden" style="width:100%;margin-top:2px;font-size:8px;" onpointerdown="devRefillAllSystems()">⚡ MAX [R]</button>
+        </div>
+    </div>
+
+    <!-- FOOTER (Mobile Touch Paddles Shown Only on Mobile; Lead Telemetry Shown on Both) -->
+    <footer class="hud-footer">
+        <div id="mobileLeftTouchGroup" class="mobile-only hardware-panel touch-group">
+            <button type="button" class="touch-paddle" onpointerdown="steerLane(-1);this.classList.add('active-press')" onpointerup="this.classList.remove('active-press')" onpointerleave="this.classList.remove('active-press')" onpointercancel="this.classList.remove('active-press')">
+                <span style="font-size:clamp(14px,2.2vmin,18px);line-height:1;color:#7dd3fc;font-weight:900;">◀</span>
+                <span class="mono" style="font-size:8px;margin-top:2px;">LEFT</span>
+            </button>
+            <button type="button" class="touch-paddle" onpointerdown="steerLane(1);this.classList.add('active-press')" onpointerup="this.classList.remove('active-press')" onpointerleave="this.classList.remove('active-press')" onpointercancel="this.classList.remove('active-press')">
+                <span style="font-size:clamp(14px,2.2vmin,18px);line-height:1;color:#7dd3fc;font-weight:900;">▶</span>
+                <span class="mono" style="font-size:8px;margin-top:2px;">RIGHT</span>
+            </button>
+        </div>
+
+        <div class="hud-collapsible hardware-panel lead-bar mono">
+            <span class="truncate">LEAD: <strong id="hudLeadName" style="color:#fff;">CLEAR</strong></span>
+            <span style="color:#334155;">|</span>
+            <span>TTC: <strong id="hudLeadTtc" style="color:#34d399;">STABLE</strong></span>
+            <span class="hide-sm" style="color:#334155;">|</span>
+            <span class="hide-sm">DGI: <strong id="hudLeadDgi" style="color:#7dd3fc;">0.00</strong></span>
+        </div>
+
+        <div id="mobileRightTouchGroup" class="mobile-only hardware-panel touch-group">
+            <button type="button" class="touch-paddle touch-paddle-brake" onpointerdown="setBraking(true);this.classList.add('active-press')" onpointerup="setBraking(false);this.classList.remove('active-press')" onpointerleave="setBraking(false);this.classList.remove('active-press')" onpointercancel="setBraking(false);this.classList.remove('active-press')">
+                <span style="font-size:clamp(12px,1.9vmin,15px);line-height:1;">🛑</span>
+                <span class="mono" style="font-size:8px;margin-top:2px;color:#fecaca;">BRAKE</span>
+            </button>
+            <button type="button" class="touch-paddle touch-paddle-nitro" onpointerdown="setBoosting(true);this.classList.add('active-press')" onpointerup="setBoosting(false);this.classList.remove('active-press')" onpointerleave="setBoosting(false);this.classList.remove('active-press')" onpointercancel="setBoosting(false);this.classList.remove('active-press')">
+                <span style="font-size:clamp(12px,1.9vmin,15px);line-height:1;">🔥</span>
+                <span class="mono" style="font-size:8px;margin-top:2px;color:#fde68a;">NITRO</span>
+            </button>
+            <button type="button" class="touch-paddle touch-paddle-emp" onpointerdown="triggerNeuralEmp();this.classList.add('active-press')" onpointerup="this.classList.remove('active-press')" onpointerleave="this.classList.remove('active-press')" onpointercancel="this.classList.remove('active-press')">
+                <span style="font-size:clamp(12px,1.9vmin,15px);line-height:1;">⚡</span>
+                <span class="mono" style="font-size:8px;margin-top:2px;color:#bae6fd;">EMP</span>
+            </button>
+        </div>
+    </footer>
+</div>
+</body>
+</html>
