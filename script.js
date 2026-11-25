@@ -532,14 +532,22 @@ function computeSeasonStatus() {
 }
 
 // =========================================================================
-// 7. REALTIME SYNC BUS (SSE + POLL + BROADCASTCHANNEL + STORAGE)
+// 7. REALTIME SYNC BUS (SSE + INCREMENTAL POLL + SERVER-TIME CRDT)
 // =========================================================================
 let localBc = null;
 try { if ('BroadcastChannel' in window) localBc = new BroadcastChannel('roadsense_v4_rt'); } catch (e) { localBc = null; }
 
 const seenEventIds = new Set();
-let rtEventSource = null, rtReconnectTimer = null, rtBackoffMs = 3000;
+let rtEventSource = null, rtReconnectTimer = null, rtPollTimer = null, rtBackoffMs = 3000;
 let rtPubQueue = [], rtPubBusy = false, lastSyncRespondTs = 0;
+let lastNtfyCursor = 'all';
+let lastCanonicalTs = 0;
+
+function getCanonicalTs(serverTimeSec, fallbackMs) {
+    const base = serverTimeSec ? (Number(serverTimeSec) * 1000) : (Number(fallbackMs) || Date.now());
+    lastCanonicalTs = Math.max(base, lastCanonicalTs + 1);
+    return lastCanonicalTs;
+}
 
 function setRealtimeStatusUI(state) {
     const text = state === 'live' ? '🟢 LIVE DB' : (state === 'syncing' ? '🟡 SYNC' : '🔴 LOCAL');
@@ -550,20 +558,44 @@ function setRealtimeStatusUI(state) {
 function flushCloudPublishQueue() {
     if (rtPubBusy || !rtPubQueue.length || isPortalExiting) return;
     rtPubBusy = true;
-    const payload = rtPubQueue.shift();
-    fetch(RT_PUB_URL, { method: 'POST', body: payload })
-        .then(() => setRealtimeStatusUI('live'))
-        .catch(() => {})
-        .finally(() => { rtPubBusy = false; if (rtPubQueue.length) setTimeout(flushCloudPublishQueue, 160); });
+    const payload = rtPubQueue[0];
+    fetch(RT_PUB_URL, { method: 'POST', body: payload, cache: 'no-store' })
+        .then(r => {
+            if (r.status === 429) {
+                // Rate-limited by ntfy.sh: keep packet in queue and retry after cooldown
+                setTimeout(() => { rtPubBusy = false; flushCloudPublishQueue(); }, 2600);
+                return;
+            }
+            rtPubQueue.shift();
+            setRealtimeStatusUI('live');
+            rtPubBusy = false;
+            if (rtPubQueue.length) setTimeout(flushCloudPublishQueue, 380);
+        })
+        .catch(() => {
+            rtPubQueue.shift();
+            rtPubBusy = false;
+            if (rtPubQueue.length) setTimeout(flushCloudPublishQueue, 500);
+        });
 }
 
 function publishRealtimeEvent(op, data = {}) {
-    const pkt = { op, eid: CLIENT_ID + '_' + Date.now().toString(36) + '_' + Math.floor(Math.random() * 1e5).toString(36), sender: CLIENT_ID, ts: Date.now(), ...data };
+    const pkt = {
+        op,
+        eid: CLIENT_ID + '_' + Date.now().toString(36) + '_' + Math.floor(Math.random() * 1e5).toString(36),
+        sender: CLIENT_ID,
+        ts: Date.now(),
+        ...data
+    };
     seenEventIds.add(pkt.eid);
-    if (seenEventIds.size > 2000) seenEventIds.clear();
+    if (seenEventIds.size > 3000) seenEventIds.clear();
     if (localBc) { try { localBc.postMessage(pkt); } catch (e) {} }
     const str = JSON.stringify(pkt);
-    if (str.length <= 3800) { rtPubQueue.push(str); flushCloudPublishQueue(); }
+    if (str.length <= 3900) {
+        // Prioritize destructive admin ops (resets/deletes) at the front of the queue
+        if (op.startsWith('score_reset') || op.startsWith('acc_delete')) rtPubQueue.unshift(str);
+        else rtPubQueue.push(str);
+        flushCloudPublishQueue();
+    }
 }
 
 function refreshAllLiveViews() {
@@ -576,88 +608,183 @@ function refreshAllLiveViews() {
     }
 }
 
+function upsertAccountFromRemote(rawAcc, evTs, fromReplay) {
+    const inc = normalizeAccountRecord(rawAcc, rawAcc && rawAcc.uid);
+    if (!inc) return false;
+    // Stamp incoming record with canonical server timeline so local clock skew cannot make it invincible
+    const recTs = Math.min(Number(inc.updatedAt) || evTs, evTs);
+    const createTs = Math.min(Number(inc.createdAt) || evTs, evTs);
+    inc.createdAt = createTs;
+    inc.updatedAt = recTs;
+
+    if (!inc.isDev) {
+        if (syncMeta.wipeAllAccountsTs > 0 && createTs <= syncMeta.wipeAllAccountsTs) return false;
+        if (syncMeta.deletedUids[inc.uid] && recTs <= syncMeta.deletedUids[inc.uid]) return false;
+    }
+
+    const resetT = Math.max(syncMeta.wipeAllScoresTs || 0, syncMeta.resetScoreTs[inc.uid] || 0);
+    const scoresValid = recTs > resetT;
+
+    const cur = accountsCache[inc.uid];
+    if (!cur) {
+        if (!scoresValid) {
+            inc.stats.allTimeBest = 0; inc.stats.bestEpoch = 1; inc.stats.totalFlashes = 0; inc.stats.seasonScores = {};
+        }
+        accountsCache[inc.uid] = inc;
+        saveAccountsCache();
+        if (scoresValid && inc.stats.allTimeBest > 0) {
+            mergeScoreEntryLocally({
+                uid: inc.uid, name: inc.name, tag: inc.tag, isDev: inc.isDev,
+                score: inc.stats.allTimeBest, epoch: inc.stats.bestEpoch,
+                accent: inc.custom.bodySecondary, skinId: inc.custom.nitroSkin,
+                isPrism: inc.custom.nitroSkin === 'void_chroma', ts: recTs
+            }, seasonStatusCache.seasonNum, inc.stats.seasonScores[seasonStatusCache.seasonNum] || 0);
+        }
+        if (!fromReplay && activeAccount && activeAccount.isDev) showToast(`⚡ Live DB: New pilot "${inc.name}" synced!`, 'ok');
+        return true;
+    }
+
+    const curSeason = cur.stats.seasonScores || {}, incSeason = inc.stats.seasonScores || {}, mergedS = {};
+    new Set([...Object.keys(curSeason), ...Object.keys(incSeason)]).forEach(k => {
+        mergedS[k] = scoresValid ? Math.max(Number(curSeason[k]) || 0, Number(incSeason[k]) || 0) : 0;
+    });
+
+    const merged = {
+        ...cur,
+        name: inc.name,
+        tag: inc.tag,
+        updatedAt: Math.max(cur.updatedAt || 0, recTs),
+        custom: { ...cur.custom, ...inc.custom },
+        seasonalSkins: inc.seasonalSkins.length >= cur.seasonalSkins.length ? inc.seasonalSkins : cur.seasonalSkins,
+        stats: {
+            allTimeBest: scoresValid ? Math.max(cur.stats.allTimeBest || 0, inc.stats.allTimeBest || 0) : 0,
+            bestEpoch: scoresValid ? Math.max(cur.stats.bestEpoch || 1, inc.stats.bestEpoch || 1) : 1,
+            totalFlashes: scoresValid ? Math.max(cur.stats.totalFlashes || 0, inc.stats.totalFlashes || 0) : 0,
+            totalRuns: Math.max(cur.stats.totalRuns || 0, inc.stats.totalRuns || 0),
+            completedEpoch250: Boolean(cur.stats.completedEpoch250 || inc.stats.completedEpoch250),
+            seasonScores: mergedS
+        }
+    };
+    accountsCache[inc.uid] = merged;
+    if (activeAccount && activeAccount.uid === inc.uid) activeAccount = merged;
+    syncAccountMetaInLeaderboards(merged);
+    saveAccountsCache();
+
+    if (scoresValid && merged.stats.allTimeBest > 0) {
+        mergeScoreEntryLocally({
+            uid: merged.uid, name: merged.name, tag: merged.tag, isDev: merged.isDev,
+            score: merged.stats.allTimeBest, epoch: merged.stats.bestEpoch,
+            accent: merged.custom.bodySecondary, skinId: merged.custom.nitroSkin,
+            isPrism: merged.custom.nitroSkin === 'void_chroma', ts: recTs
+        }, seasonStatusCache.seasonNum, merged.stats.seasonScores[seasonStatusCache.seasonNum] || 0);
+    }
+    return true;
+}
+
 function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
-    if (!pkt || typeof pkt !== 'object' || !pkt.op || pkt.sender === CLIENT_ID) return;
-    if (pkt.eid) { if (seenEventIds.has(pkt.eid)) return; seenEventIds.add(pkt.eid); }
-    const evTs = Number(pkt.ts) || Date.now();
+    if (!pkt || typeof pkt !== 'object' || !pkt.op) return;
+    if (!fromReplay && pkt.sender === CLIENT_ID) return;
+    if (pkt.eid) {
+        if (seenEventIds.has(pkt.eid)) return;
+        seenEventIds.add(pkt.eid);
+    }
+
+    const evTs = Number(pkt.serverTs) || Number(pkt.ts) || Date.now();
     let changed = false;
 
-    if (pkt.op === 'sync_meta' && pkt.meta) {
+    if ((pkt.op === 'sync_meta' || pkt.op === 'db_snapshot') && pkt.meta) {
         const m = pkt.meta;
-        if (Number(m.wipeAllAccountsTs) > syncMeta.wipeAllAccountsTs) { syncMeta.wipeAllAccountsTs = Number(m.wipeAllAccountsTs); changed = true; }
-        if (Number(m.wipeAllScoresTs) > syncMeta.wipeAllScoresTs) { syncMeta.wipeAllScoresTs = Number(m.wipeAllScoresTs); changed = true; }
+        if (Number(m.wipeAllAccountsTs) > syncMeta.wipeAllAccountsTs) {
+            syncMeta.wipeAllAccountsTs = Number(m.wipeAllAccountsTs);
+            applyDeleteAllNonDevLocally(syncMeta.wipeAllAccountsTs, false, true);
+            changed = true;
+        }
+        if (Number(m.wipeAllScoresTs) > syncMeta.wipeAllScoresTs) {
+            syncMeta.wipeAllScoresTs = Number(m.wipeAllScoresTs);
+            applyResetAllScoresLocally();
+            changed = true;
+        }
         if (m.deletedUids && typeof m.deletedUids === 'object') {
-            Object.entries(m.deletedUids).forEach(([u, t]) => { if (u !== CANONICAL_DEV_UID && Number(t) > (syncMeta.deletedUids[u] || 0)) { syncMeta.deletedUids[u] = Number(t); changed = true; } });
+            Object.entries(m.deletedUids).forEach(([u, t]) => {
+                if (u !== CANONICAL_DEV_UID && Number(t) > (syncMeta.deletedUids[u] || 0)) {
+                    syncMeta.deletedUids[u] = Number(t);
+                    applyAccountDeleteLocally(u, false);
+                    changed = true;
+                }
+            });
         }
         if (m.resetScoreTs && typeof m.resetScoreTs === 'object') {
-            Object.entries(m.resetScoreTs).forEach(([u, t]) => { if (Number(t) > (syncMeta.resetScoreTs[u] || 0)) { syncMeta.resetScoreTs[u] = Number(t); changed = true; } });
-        }
-        if (changed) { saveSyncMeta(); enforceTombstonesLocally(); }
-    } else if (pkt.op === 'acc_upsert' && pkt.acc) {
-        const inc = normalizeAccountRecord(pkt.acc, pkt.acc.uid);
-        if (!inc) return;
-        if (!inc.isDev && (inc.createdAt < syncMeta.wipeAllAccountsTs || (syncMeta.deletedUids[inc.uid] && inc.updatedAt <= syncMeta.deletedUids[inc.uid]))) return;
-        const cur = accountsCache[inc.uid];
-        if (!cur) {
-            accountsCache[inc.uid] = inc; saveAccountsCache(); changed = true;
-            if (!fromReplay && activeAccount && activeAccount.isDev) showToast(`⚡ Live DB: New pilot "${inc.name}" synced!`, 'ok');
-        } else if (inc.updatedAt >= (cur.updatedAt || 0)) {
-            const resetT = Math.max(syncMeta.wipeAllScoresTs, syncMeta.resetScoreTs[inc.uid] || 0);
-            const curS = cur.stats.seasonScores || {}, incS = inc.stats.seasonScores || {}, mergedS = {};
-            new Set([...Object.keys(curS), ...Object.keys(incS)]).forEach(k => { mergedS[k] = evTs > resetT ? Math.max(Number(curS[k]) || 0, Number(incS[k]) || 0) : 0; });
-            const merged = {
-                ...cur, name: inc.name, tag: inc.tag, updatedAt: Math.max(cur.updatedAt || 0, inc.updatedAt),
-                custom: { ...cur.custom, ...inc.custom },
-                seasonalSkins: inc.seasonalSkins.length >= cur.seasonalSkins.length ? inc.seasonalSkins : cur.seasonalSkins,
-                stats: {
-                    allTimeBest: evTs > resetT ? Math.max(cur.stats.allTimeBest || 0, inc.stats.allTimeBest || 0) : 0,
-                    bestEpoch: evTs > resetT ? Math.max(cur.stats.bestEpoch || 1, inc.stats.bestEpoch || 1) : 1,
-                    totalFlashes: evTs > resetT ? Math.max(cur.stats.totalFlashes || 0, inc.stats.totalFlashes || 0) : 0,
-                    totalRuns: Math.max(cur.stats.totalRuns || 0, inc.stats.totalRuns || 0),
-                    completedEpoch250: Boolean(cur.stats.completedEpoch250 || inc.stats.completedEpoch250),
-                    seasonScores: mergedS
+            Object.entries(m.resetScoreTs).forEach(([u, t]) => {
+                if (Number(t) > (syncMeta.resetScoreTs[u] || 0)) {
+                    syncMeta.resetScoreTs[u] = Number(t);
+                    applyScoreResetLocally(u);
+                    changed = true;
                 }
-            };
-            accountsCache[inc.uid] = merged;
-            if (activeAccount && activeAccount.uid === inc.uid) activeAccount = merged;
-            syncAccountMetaInLeaderboards(merged); saveAccountsCache(); changed = true;
+            });
         }
-        const accNow = accountsCache[inc.uid];
-        if (accNow && accNow.stats.allTimeBest > 0) {
-            const resetT = Math.max(syncMeta.wipeAllScoresTs, syncMeta.resetScoreTs[inc.uid] || 0);
-            if (accNow.updatedAt > resetT) {
-                mergeScoreEntryLocally({
-                    uid: accNow.uid, name: accNow.name, tag: accNow.tag, isDev: accNow.isDev,
-                    score: accNow.stats.allTimeBest, epoch: accNow.stats.bestEpoch,
-                    accent: accNow.custom.bodySecondary, skinId: accNow.custom.nitroSkin,
-                    isPrism: accNow.custom.nitroSkin === 'void_chroma', ts: accNow.updatedAt
-                }, seasonStatusCache.seasonNum, accNow.stats.seasonScores[seasonStatusCache.seasonNum] || 0);
-            }
-        }
+        if (changed) saveSyncMeta();
+    }
+
+    if (pkt.op === 'db_snapshot' && Array.isArray(pkt.accounts)) {
+        pkt.accounts.forEach(a => { if (upsertAccountFromRemote(a, evTs, fromReplay)) changed = true; });
+    } else if (pkt.op === 'acc_upsert' && pkt.acc) {
+        if (upsertAccountFromRemote(pkt.acc, evTs, fromReplay)) changed = true;
     } else if (pkt.op === 'score_record' && pkt.entry && pkt.entry.uid) {
         const e = pkt.entry;
-        if (e.uid !== CANONICAL_DEV_UID && ((syncMeta.deletedUids[e.uid] && evTs <= syncMeta.deletedUids[e.uid]) || evTs < syncMeta.wipeAllAccountsTs)) return;
-        if (evTs < syncMeta.wipeAllScoresTs || (syncMeta.resetScoreTs[e.uid] && evTs <= syncMeta.resetScoreTs[e.uid])) return;
+        if (e.uid !== CANONICAL_DEV_UID) {
+            if (syncMeta.deletedUids[e.uid] && evTs <= syncMeta.deletedUids[e.uid]) return;
+            if (syncMeta.wipeAllAccountsTs > 0 && evTs <= syncMeta.wipeAllAccountsTs) return;
+        }
+        if (syncMeta.wipeAllScoresTs > 0 && evTs <= syncMeta.wipeAllScoresTs) return;
+        if (syncMeta.resetScoreTs[e.uid] && evTs <= syncMeta.resetScoreTs[e.uid]) return;
+
         mergeScoreEntryLocally(e, pkt.sNum || seasonStatusCache.seasonNum, Number(pkt.sScore || e.score));
         if (accountsCache[e.uid]) {
             const a = accountsCache[e.uid];
             a.stats.allTimeBest = Math.max(a.stats.allTimeBest || 0, Number(e.score) || 0);
             a.stats.bestEpoch = Math.max(a.stats.bestEpoch || 1, Number(e.epoch) || 1);
             if (pkt.sNum) a.stats.seasonScores[pkt.sNum] = Math.max(a.stats.seasonScores[pkt.sNum] || 0, Number(pkt.sScore || e.score) || 0);
-            a.updatedAt = Math.max(a.updatedAt || 0, evTs); saveAccountsCache();
+            a.updatedAt = evTs;
+            saveAccountsCache();
         }
         changed = true;
     } else if (pkt.op === 'score_reset' && pkt.uid) {
-        if (evTs > (syncMeta.resetScoreTs[pkt.uid] || 0)) { syncMeta.resetScoreTs[pkt.uid] = evTs; saveSyncMeta(); applyScoreResetLocally(pkt.uid); changed = true; if (!fromReplay) showToast('⚡ Live DB: Score reset synced.'); }
+        if (!fromReplay || evTs >= (syncMeta.resetScoreTs[pkt.uid] || 0)) {
+            syncMeta.resetScoreTs[pkt.uid] = Math.max(evTs, syncMeta.resetScoreTs[pkt.uid] || 0);
+            saveSyncMeta();
+            applyScoreResetLocally(pkt.uid);
+            changed = true;
+            if (!fromReplay) showToast('⚡ Live DB: Score reset synced.');
+        }
     } else if (pkt.op === 'score_reset_all') {
-        if (evTs > syncMeta.wipeAllScoresTs) { syncMeta.wipeAllScoresTs = evTs; saveSyncMeta(); applyResetAllScoresLocally(); changed = true; if (!fromReplay) showToast('⚡ Live DB: All scores reset.'); }
+        if (!fromReplay || evTs >= syncMeta.wipeAllScoresTs) {
+            syncMeta.wipeAllScoresTs = Math.max(evTs, syncMeta.wipeAllScoresTs || 0);
+            saveSyncMeta();
+            applyResetAllScoresLocally();
+            changed = true;
+            if (!fromReplay) showToast('⚡ Live DB: All scores reset.');
+        }
     } else if (pkt.op === 'acc_delete' && pkt.uid && pkt.uid !== CANONICAL_DEV_UID) {
-        if (evTs > (syncMeta.deletedUids[pkt.uid] || 0)) { syncMeta.deletedUids[pkt.uid] = evTs; saveSyncMeta(); applyAccountDeleteLocally(pkt.uid, !fromReplay); changed = true; }
+        if (!fromReplay || evTs >= (syncMeta.deletedUids[pkt.uid] || 0)) {
+            syncMeta.deletedUids[pkt.uid] = Math.max(evTs, syncMeta.deletedUids[pkt.uid] || 0);
+            saveSyncMeta();
+            applyAccountDeleteLocally(pkt.uid, !fromReplay);
+            changed = true;
+        }
     } else if (pkt.op === 'acc_delete_all') {
-        if (evTs > syncMeta.wipeAllAccountsTs) { syncMeta.wipeAllAccountsTs = evTs; saveSyncMeta(); applyDeleteAllNonDevLocally(evTs, !fromReplay); changed = true; }
+        if (!fromReplay || evTs >= syncMeta.wipeAllAccountsTs) {
+            syncMeta.wipeAllAccountsTs = Math.max(evTs, syncMeta.wipeAllAccountsTs || 0);
+            saveSyncMeta();
+            // Force-delete all non-dev accounts regardless of local clock skew
+            applyDeleteAllNonDevLocally(syncMeta.wipeAllAccountsTs, !fromReplay, true);
+            changed = true;
+        }
     } else if (pkt.op === 'mail_broadcast' && pkt.mail && pkt.mail.title && pkt.mail.body) {
         Object.values(accountsCache).forEach(acc => {
-            if (!(acc.inbox || []).some(m => m.id === pkt.mail.id)) { acc.inbox.unshift({ ...pkt.mail, read: false }); if (acc.inbox.length > 50) acc.inbox.length = 50; }
+            if (!(acc.inbox || []).some(m => m.id === pkt.mail.id)) {
+                acc.inbox.unshift({ ...pkt.mail, read: false });
+                if (acc.inbox.length > 50) acc.inbox.length = 50;
+            }
         });
         saveAccountsCache(); changed = true;
         if (!fromReplay && activeAccount) showToast(`📬 New Mail: ${pkt.mail.title}`, 'ok');
@@ -670,24 +797,27 @@ function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
         }
     } else if (pkt.op === 'sync_req' && !fromReplay) {
         const now = Date.now();
-        if (now - lastSyncRespondTs > 4500) {
+        if (now - lastSyncRespondTs > 5000) {
             lastSyncRespondTs = now;
             setTimeout(() => {
-                publishRealtimeEvent('sync_meta', { meta: syncMeta });
-                Object.values(accountsCache).slice(0, 25).forEach((acc, idx) => { setTimeout(() => publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(acc) }), idx * 180); });
-            }, 150 + Math.floor(Math.random() * 350));
+                publishRealtimeEvent('db_snapshot', {
+                    meta: syncMeta,
+                    accounts: Object.values(accountsCache).slice(0, 18).map(packAccountForSync)
+                });
+            }, 250 + Math.floor(Math.random() * 450));
         }
     }
+
     if (changed) refreshAllLiveViews();
 }
 
 function enforceTombstonesLocally() {
     let mod = false;
     Object.values(accountsCache).forEach(acc => {
-        if (!acc.isDev && (acc.createdAt < syncMeta.wipeAllAccountsTs || (syncMeta.deletedUids[acc.uid] && acc.updatedAt <= syncMeta.deletedUids[acc.uid]))) {
+        if (!acc.isDev && ((syncMeta.wipeAllAccountsTs > 0 && acc.createdAt <= syncMeta.wipeAllAccountsTs) || (syncMeta.deletedUids[acc.uid] && acc.updatedAt <= syncMeta.deletedUids[acc.uid]))) {
             applyAccountDeleteLocally(acc.uid, false); mod = true;
         }
-        const rTs = Math.max(syncMeta.wipeAllScoresTs, syncMeta.resetScoreTs[acc.uid] || 0);
+        const rTs = Math.max(syncMeta.wipeAllScoresTs || 0, syncMeta.resetScoreTs[acc.uid] || 0);
         if (rTs > 0 && (acc.updatedAt || 0) <= rTs && (acc.stats.allTimeBest > 0 || Object.keys(acc.stats.seasonScores || {}).length > 0)) {
             applyScoreResetLocally(acc.uid); mod = true;
         }
@@ -742,10 +872,10 @@ function applyAccountDeleteLocally(uid, notify) {
         returnToMainMenu(); showAuthFeedback('Your account was deleted.', false);
     } else if (notify && existed && activeAccount && activeAccount.isDev) showToast(`⚡ Live DB: Deleted "${existed.name}"`);
 }
-function applyDeleteAllNonDevLocally(wipeTs, notify) {
+function applyDeleteAllNonDevLocally(wipeTs, notify, ignoreClockSkew = false) {
     let removed = 0;
     Object.values(accountsCache).forEach(a => {
-        if (!a.isDev && a.createdAt <= wipeTs) {
+        if (!a.isDev && (ignoreClockSkew || a.createdAt <= wipeTs)) {
             delete accountsCache[a.uid]; removeUidFromLeaderboards(a.uid); deleteCustomSongByUid(a.uid);
             if (lastLoggedOutUid === a.uid) { lastLoggedOutUid = ''; lsRemove(STORAGE_LAST_OUT_KEY); }
             if (activeAccount && activeAccount.uid === a.uid) {
@@ -764,41 +894,62 @@ function handleRawNtfyEnvelope(rawStr, fromReplay) {
     try {
         const env = JSON.parse(rawStr);
         if (!env || env.event !== 'message' || typeof env.message !== 'string') return;
-        applyIncomingRealtimeEvent(JSON.parse(env.message), fromReplay);
+        if (env.id) lastNtfyCursor = env.id;
+        const pkt = JSON.parse(env.message);
+        pkt.serverTs = getCanonicalTs(env.time, pkt.ts);
+        applyIncomingRealtimeEvent(pkt, fromReplay);
     } catch (e) {}
 }
 
 function pullCloudHistoryAndSync(sendHello = false) {
-    setRealtimeStatusUI('syncing');
-    fetch(RT_POLL_URL)
+    const pollUrl = `https://ntfy.sh/${RT_TOPIC}/json?poll=1&since=${encodeURIComponent(lastNtfyCursor || 'all')}`;
+    const isInitialReplay = (lastNtfyCursor === 'all');
+    if (isInitialReplay) setRealtimeStatusUI('syncing');
+    fetch(pollUrl, { cache: 'no-store' })
         .then(r => r.ok ? r.text() : '')
         .then(txt => {
-            if (txt) txt.split('\n').forEach(line => { const t = line.trim(); if (t) handleRawNtfyEnvelope(t, true); });
+            if (txt) {
+                txt.split('\n').forEach(line => {
+                    const t = line.trim();
+                    if (t) handleRawNtfyEnvelope(t, isInitialReplay);
+                });
+            }
             setRealtimeStatusUI('live');
             if (sendHello) publishRealtimeEvent('sync_req');
         })
-        .catch(() => setRealtimeStatusUI('offline'));
+        .catch(() => { if (isInitialReplay) setRealtimeStatusUI('offline'); });
 }
 
 function connectRealtimeStream() {
-    if (isPortalExiting || !('EventSource' in window)) return;
+    if (isPortalExiting) return;
+    // Start 4-second incremental background poll so mobile/firewalled devices stay in sync even if SSE stalls
+    if (!rtPollTimer) {
+        rtPollTimer = setInterval(() => {
+            if (!isPortalExiting && document.visibilityState !== 'hidden') pullCloudHistoryAndSync(false);
+        }, 4000);
+    }
+    if (!('EventSource' in window)) return;
     if (rtEventSource) { try { rtEventSource.close(); } catch (e) {} rtEventSource = null; }
     try {
-        rtEventSource = new EventSource(RT_SSE_URL);
+        const sseUrl = `https://ntfy.sh/${RT_TOPIC}/sse?since=${encodeURIComponent(lastNtfyCursor || 'all')}`;
+        rtEventSource = new EventSource(sseUrl);
         rtEventSource.onopen = () => { rtBackoffMs = 3000; setRealtimeStatusUI('live'); };
         rtEventSource.onmessage = ev => { if (ev && typeof ev.data === 'string') handleRawNtfyEnvelope(ev.data, false); };
         rtEventSource.onerror = () => {
-            setRealtimeStatusUI('offline');
             if (rtEventSource) { try { rtEventSource.close(); } catch (e) {} rtEventSource = null; }
             if (rtReconnectTimer) clearTimeout(rtReconnectTimer);
             rtReconnectTimer = setTimeout(() => { rtBackoffMs = Math.min(15000, rtBackoffMs * 1.5); connectRealtimeStream(); }, rtBackoffMs);
         };
-    } catch (e) { setRealtimeStatusUI('offline'); }
+    } catch (e) {}
 }
 
 function forceManualCloudSync() {
-    pullCloudHistoryAndSync(true);
-    Object.values(accountsCache).slice(0, 25).forEach((acc, i) => { setTimeout(() => publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(acc) }), i * 160); });
+    lastNtfyCursor = 'all';
+    pullCloudHistoryAndSync(false);
+    publishRealtimeEvent('db_snapshot', {
+        meta: syncMeta,
+        accounts: Object.values(accountsCache).slice(0, 18).map(packAccountForSync)
+    });
     showToast('Syncing Realtime DB...', 'info'); playSfx('uiClick');
 }
 
