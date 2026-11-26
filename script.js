@@ -633,30 +633,12 @@ function normalizeAccountRecord(acc, uidKey) {
     const cust = (acc.custom && typeof acc.custom === 'object') ? acc.custom : {};
     const createdAt = isDev ? CANONICAL_SEASON_ORIGIN : (Number(acc.createdAt) || Date.now());
     const joinedSeason = isDev ? 1 : Math.max(1, Number(acc.joinedSeason) || 1);
-    const readMailIds = (acc.readMailIds && typeof acc.readMailIds === 'object' && !Array.isArray(acc.readMailIds)) ? { ...acc.readMailIds } : {};
-    const deletedMailIds = (acc.deletedMailIds && typeof acc.deletedMailIds === 'object' && !Array.isArray(acc.deletedMailIds)) ? { ...acc.deletedMailIds } : {};
-    const claimedMailIds = (acc.claimedMailIds && typeof acc.claimedMailIds === 'object' && !Array.isArray(acc.claimedMailIds)) ? { ...acc.claimedMailIds } : {};
+    const accMailVer = typeof acc.mailVer === 'number' ? acc.mailVer : 0;
+    const isMailWiped = accMailVer < (syncMeta.wipeAllMailVer || 0);
 
-    // Migrate any read/claimed states or recent broadcasts from legacy per-account inbox array
-    toArraySafe(acc.inbox).forEach(m => {
-        if (!m || !m.id) return;
-        const mid = sanitizeDbKey(m.id);
-        if (m.read) readMailIds[mid] = true;
-        if (m.reward && m.reward.claimed) claimedMailIds[mid] = true;
-        if (mid.startsWith('bc_') && (Date.now() - Number(m.ts || 0)) < MAIL_TTL_MS && !syncMeta.expiredMailIds[mid]) {
-            upsertGlobalMailLocally({
-                id: mid,
-                kind: 'broadcast',
-                seasonNum: 0,
-                title: String(m.title || 'Broadcast'),
-                sender: String(m.sender || 'DEV BROADCAST'),
-                body: String(m.body || ''),
-                ts: Number(m.ts) || Date.now(),
-                mailVer: syncMeta.wipeAllMailVer,
-                reward: null
-            });
-        }
-    });
+    const readMailIds = (!isMailWiped && acc.readMailIds && typeof acc.readMailIds === 'object' && !Array.isArray(acc.readMailIds)) ? { ...acc.readMailIds } : {};
+    const deletedMailIds = (!isMailWiped && acc.deletedMailIds && typeof acc.deletedMailIds === 'object' && !Array.isArray(acc.deletedMailIds)) ? { ...acc.deletedMailIds } : {};
+    const claimedMailIds = (!isMailWiped && acc.claimedMailIds && typeof acc.claimedMailIds === 'object' && !Array.isArray(acc.claimedMailIds)) ? { ...acc.claimedMailIds } : {};
 
     return {
         uid,
@@ -669,7 +651,7 @@ function normalizeAccountRecord(acc, uidKey) {
         accVer: typeof acc.accVer === 'number' ? acc.accVer : (syncMeta.wipeAllAccountsVer || 0),
         scoreVer: typeof acc.scoreVer === 'number' ? acc.scoreVer : (syncMeta.wipeAllScoresVer || 0),
         indivScoreVer: typeof acc.indivScoreVer === 'number' ? acc.indivScoreVer : ((syncMeta.resetScoreVer && syncMeta.resetScoreVer[uid]) || 0),
-        mailVer: typeof acc.mailVer === 'number' ? acc.mailVer : (syncMeta.wipeAllMailVer || 0),
+        mailVer: syncMeta.wipeAllMailVer || 0,
         seasonResetVer: typeof acc.seasonResetVer === 'number' ? acc.seasonResetVer : (Number(seasonStateCache.seasonResetVer) || 0),
         editVer: typeof acc.editVer === 'number' ? acc.editVer : 1,
         stats: {
