@@ -14,7 +14,6 @@ if (typeof CanvasRenderingContext2D !== 'undefined' && !CanvasRenderingContext2D
     };
 }
 
-// Universal safe color-with-alpha helper (works with #hex, hsl, hsla, rgb, rgba without ever crashing CanvasGradient.addColorStop)
 function colorWithAlpha(col, alpha) {
     const s = String(col || '#38bdf8').trim();
     const a = Math.max(0, Math.min(1, Number(alpha) || 0));
@@ -36,8 +35,13 @@ function colorWithAlpha(col, alpha) {
 }
 
 // =========================================================================
-// 1. DATABASE KEYS, DEV UID & REALTIME SYNC CONFIG
+// 1. DATABASE KEYS, FIREBASE 24/7 CONFIG & INDEXEDDB LOCAL ENGINE
 // =========================================================================
+// PASTE YOUR FIREBASE REALTIME DATABASE URL BELOW (e.g. "https://your-project-default-rtdb.firebaseio.com")
+const FIREBASE_DB_URL = 'https://galaxy-racer-1a578-default-rtdb.asia-southeast1.firebasedatabase.app';
+
+const FB_BASE_URL = FIREBASE_DB_URL ? FIREBASE_DB_URL.trim().replace(/\/+$/, '') + '/roadsense_v4' : '';
+
 const STORAGE_ACCOUNTS_KEY   = 'roadsense_v4_accounts';
 const STORAGE_ACTIVE_UID_KEY = 'roadsense_v4_active_uid';
 const STORAGE_LAST_OUT_KEY   = 'roadsense_v4_last_logout_uid';
@@ -48,12 +52,8 @@ const STORAGE_SEASON_KEY     = 'roadsense_v4_season_state';
 const STORAGE_LB_ALL_KEY     = 'roadsense_v4_lb_alltime';
 const STORAGE_LB_SEASON_KEY  = 'roadsense_v4_lb_season';
 const STORAGE_ALLTIME_CHAMP  = 'roadsense_v4_alltime_champ_uid';
-const CUSTOM_SONGS_DB_NAME   = 'RoadSenseCustomSongsDB_v4';
-
-const RT_TOPIC    = 'roadsense_overdrive_v4_live_9f4c2a';
-const RT_PUB_URL  = `https://ntfy.sh/${RT_TOPIC}`;
-const RT_SSE_URL  = `https://ntfy.sh/${RT_TOPIC}/sse?since=all`;
-const RT_POLL_URL = `https://ntfy.sh/${RT_TOPIC}/json?poll=1&since=all`;
+const LOCAL_IDB_NAME         = 'RoadSenseLocalDB_v4';
+const LOCAL_IDB_VERSION      = 2;
 
 const CANONICAL_DEV_UID = '84729160538274195';
 const DEFAULT_DEV_NAME  = 'Unknown';
@@ -65,9 +65,72 @@ const SEASON_GAP_MS    = 1 * 24 * 60 * 60 * 1000;
 const SEASON_CYCLE_MS  = SEASON_ACTIVE_MS + SEASON_GAP_MS;
 
 function lsGet(k, fb = null) { try { const v = localStorage.getItem(k); return v === null ? fb : v; } catch (e) { return fb; } }
-function lsSet(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } }
-function lsRemove(k) { try { localStorage.removeItem(k); } catch (e) {} }
+function lsSet(k, v) { try { localStorage.setItem(k, v); idbMirrorSet(k, v); return true; } catch (e) { idbMirrorSet(k, v); return false; } }
+function lsRemove(k) { try { localStorage.removeItem(k); idbMirrorDelete(k); } catch (e) {} }
 function lsGetJson(k, fb) { try { const r = localStorage.getItem(k); if (!r) return fb; const p = JSON.parse(r); return p == null ? fb : p; } catch (e) { return fb; } }
+
+// Unified IndexedDB Engine: Stores both Custom Audio Songs ('songs') AND Local Database Mirror ('kv')
+let localIdbPromise = null;
+function openLocalIDB() {
+    if (!('indexedDB' in window)) return Promise.reject(new Error('IndexedDB unavailable'));
+    if (localIdbPromise) return localIdbPromise;
+    localIdbPromise = new Promise((res, rej) => {
+        const req = indexedDB.open(LOCAL_IDB_NAME, LOCAL_IDB_VERSION);
+        req.onupgradeneeded = e => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains('songs')) db.createObjectStore('songs', { keyPath: 'uid' });
+            if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv', { keyPath: 'key' });
+        };
+        req.onsuccess = () => res(req.result);
+        req.onerror = () => { localIdbPromise = null; rej(req.error); };
+        req.onblocked = () => { localIdbPromise = null; rej(new Error('IDB blocked')); };
+    });
+    return localIdbPromise;
+}
+
+function idbMirrorSet(key, val) {
+    openLocalIDB().then(db => {
+        const tx = db.transaction('kv', 'readwrite');
+        tx.objectStore('kv').put({ key, val, ts: Date.now() });
+    }).catch(() => {});
+}
+
+function idbMirrorDelete(key) {
+    openLocalIDB().then(db => {
+        const tx = db.transaction('kv', 'readwrite');
+        tx.objectStore('kv').delete(key);
+    }).catch(() => {});
+}
+
+async function restoreFromIndexedDBIfNeeded() {
+    try {
+        const db = await openLocalIDB();
+        const allKv = await new Promise(res => {
+            const req = db.transaction('kv', 'readonly').objectStore('kv').getAll();
+            req.onsuccess = () => res(req.result || []);
+            req.onerror = () => res([]);
+        });
+        let restored = false;
+        allKv.forEach(item => {
+            if (!item || !item.key || !item.val) return;
+            const cur = lsGet(item.key, null);
+            if (!cur || (item.key === STORAGE_ACCOUNTS_KEY && cur === '{}')) {
+                try { localStorage.setItem(item.key, item.val); restored = true; } catch (e) {}
+            }
+        });
+        if (restored) {
+            const accs = lsGetJson(STORAGE_ACCOUNTS_KEY, null);
+            if (accs && typeof accs === 'object') {
+                Object.entries(accs).forEach(([u, a]) => {
+                    const norm = normalizeAccountRecord(a, u);
+                    if (norm && !accountsCache[u]) accountsCache[u] = norm;
+                });
+                validateAndSanitizeDatabase();
+                refreshAllLiveViews();
+            }
+        }
+    } catch (e) {}
+}
 
 (function purgeLegacyV3DataOnce() {
     if (lsGet(STORAGE_V4_RESET_DONE, '') === '1') return;
@@ -388,7 +451,7 @@ const COLOR_SWATCHES = {
 };
 
 // =========================================================================
-// 6. ACCOUNT DB + CRDT TOMBSTONES + REALTIME SYNC
+// 6. ACCOUNT DB + CRDT TOMBSTONES + HYBRID FIREBASE/INDEXEDDB SYNC
 // =========================================================================
 let accountsCache = (() => {
     const p = lsGetJson(STORAGE_ACCOUNTS_KEY, {});
@@ -396,14 +459,17 @@ let accountsCache = (() => {
 })();
 
 let syncMeta = (() => {
-    const def = { wipeAllAccountsTs: 0, wipeAllScoresTs: 0, deletedUids: {}, resetScoreTs: {} };
+    const def = { wipeAllAccountsTs: 0, wipeAllScoresTs: 0, wipeAllAccountsVer: 0, wipeAllScoresVer: 0, deletedUids: {}, resetScoreTs: {}, resetScoreVer: {} };
     const r = lsGetJson(STORAGE_SYNC_META_KEY, null);
     if (!r || typeof r !== 'object') return def;
     return {
         wipeAllAccountsTs: Number(r.wipeAllAccountsTs) || 0,
         wipeAllScoresTs: Number(r.wipeAllScoresTs) || 0,
+        wipeAllAccountsVer: Number(r.wipeAllAccountsVer) || 0,
+        wipeAllScoresVer: Number(r.wipeAllScoresVer) || 0,
         deletedUids: (r.deletedUids && typeof r.deletedUids === 'object') ? r.deletedUids : {},
-        resetScoreTs: (r.resetScoreTs && typeof r.resetScoreTs === 'object') ? r.resetScoreTs : {}
+        resetScoreTs: (r.resetScoreTs && typeof r.resetScoreTs === 'object') ? r.resetScoreTs : {},
+        resetScoreVer: (r.resetScoreVer && typeof r.resetScoreVer === 'object') ? r.resetScoreVer : {}
     };
 })();
 function saveSyncMeta() { lsSet(STORAGE_SYNC_META_KEY, JSON.stringify(syncMeta)); }
@@ -422,6 +488,10 @@ function normalizeAccountRecord(acc, uidKey) {
         isDev: uid === CANONICAL_DEV_UID,
         createdAt: Number(acc.createdAt) || Date.now(),
         updatedAt: Number(acc.updatedAt) || Number(acc.createdAt) || Date.now(),
+        accVer: typeof acc.accVer === 'number' ? acc.accVer : (syncMeta.wipeAllAccountsVer || 0),
+        scoreVer: typeof acc.scoreVer === 'number' ? acc.scoreVer : (syncMeta.wipeAllScoresVer || 0),
+        indivScoreVer: typeof acc.indivScoreVer === 'number' ? acc.indivScoreVer : ((syncMeta.resetScoreVer && syncMeta.resetScoreVer[uid]) || 0),
+        editVer: typeof acc.editVer === 'number' ? acc.editVer : 1,
         stats: {
             allTimeBest: Math.max(0, Number(st.allTimeBest) || 0),
             bestEpoch: Math.max(1, Number(st.bestEpoch) || 1),
@@ -456,6 +526,10 @@ function makeAccountObj({ uid, name, tag, isDev = false }) {
     return {
         uid, name: name.trim(), tag: tag.trim(), isDev: uid === CANONICAL_DEV_UID,
         createdAt: now, updatedAt: now,
+        accVer: syncMeta.wipeAllAccountsVer || 0,
+        scoreVer: syncMeta.wipeAllScoresVer || 0,
+        indivScoreVer: (syncMeta.resetScoreVer && syncMeta.resetScoreVer[uid]) || 0,
+        editVer: 1,
         stats: { allTimeBest: 0, bestEpoch: 1, totalFlashes: 0, totalRuns: 0, completedEpoch250: false, seasonScores: {} },
         custom: isDev
             ? { bodyPrimary: '#1a2236', bodySecondary: '#00f5d4', canopyColor: '#c77dff', empColor: '#00f5d4', boostColor: '#ff007f', nitroSkin: 'void_chroma' }
@@ -468,6 +542,10 @@ function packAccountForSync(acc) {
     return {
         uid: acc.uid, name: acc.name, tag: acc.tag, isDev: acc.isDev,
         createdAt: acc.createdAt, updatedAt: acc.updatedAt || Date.now(),
+        accVer: typeof acc.accVer === 'number' ? acc.accVer : syncMeta.wipeAllAccountsVer,
+        scoreVer: typeof acc.scoreVer === 'number' ? acc.scoreVer : syncMeta.wipeAllScoresVer,
+        indivScoreVer: typeof acc.indivScoreVer === 'number' ? acc.indivScoreVer : (syncMeta.resetScoreVer[acc.uid] || 0),
+        editVer: typeof acc.editVer === 'number' ? acc.editVer : 1,
         stats: acc.stats, custom: acc.custom,
         seasonalSkins: (acc.seasonalSkins || []).slice(-6)
     };
@@ -486,7 +564,7 @@ function validateAndSanitizeDatabase() {
     if (!accountsCache[CANONICAL_DEV_UID]) {
         accountsCache[CANONICAL_DEV_UID] = makeAccountObj({ uid: CANONICAL_DEV_UID, name: DEFAULT_DEV_NAME, tag: DEFAULT_DEV_TAG, isDev: true });
         pushMail(accountsCache[CANONICAL_DEV_UID], {
-            title: 'Dev Root Ready (Realtime Sync Active)',
+            title: 'Dev Root Ready (IndexedDB + Firebase 24/7)',
             sender: 'SYSTEM',
             body: 'Your unique 17-digit Dev UID is synced across all browsers.\nNames & IDs are completely unrestricted for all players.'
         });
@@ -532,17 +610,15 @@ function computeSeasonStatus() {
 }
 
 // =========================================================================
-// 7. REALTIME SYNC BUS (PROVEN V10 PACKET ARCHITECTURE + CLOCK-IMMUNE VERSIONS)
+// 7. QUOTA-SAFE FIREBASE 24/7 + INDEXEDDB + LOCAL BROADCAST SYNC ENGINE
 // =========================================================================
-const RT_SYNC_URL_V12 = 'https://ntfy.sh/roadsense_overdrive_v4_global_sync_v12';
 let localBc = null;
 try { if ('BroadcastChannel' in window) localBc = new BroadcastChannel('roadsense_v4_rt_v12'); } catch (e) { localBc = null; }
 
 let rtEventSource = null, rtReconnectTimer = null, rtPollTimer = null;
-let isPullingCloud = false;
+let isPullingCloud = false, lastSeenPulsePid = '';
 const seenPacketIds = new Set();
 
-// Ensure version-counter fields exist in syncMeta (100% immune to PC vs Mobile clock differences)
 function ensureSyncMetaVersions() {
     if (typeof syncMeta.wipeAllAccountsVer !== 'number') syncMeta.wipeAllAccountsVer = 0;
     if (typeof syncMeta.wipeAllScoresVer !== 'number') syncMeta.wipeAllScoresVer = 0;
@@ -552,8 +628,8 @@ function ensureSyncMetaVersions() {
 ensureSyncMetaVersions();
 
 function setRealtimeStatusUI(state) {
-    const text = state === 'live' ? '🟢 LIVE DB' : (state === 'syncing' ? '🟡 SYNC' : '🔴 LOCAL');
-    const cls = state === 'live' ? 'badge badge-emerald mono' : (state === 'syncing' ? 'badge badge-amber mono' : 'badge badge-red mono');
+    const text = state === 'live' ? '🟢 LIVE DB' : (state === 'syncing' ? '🟡 SYNC' : '🔵 LOCAL IDB');
+    const cls = state === 'live' ? 'badge badge-emerald mono' : (state === 'syncing' ? 'badge badge-amber mono' : 'badge badge-sky mono');
     ['rtSyncStatusBadge', 'devRtBadge'].forEach(id => {
         const el = document.getElementById(id);
         if (el) { el.innerText = text; el.className = cls; }
@@ -573,45 +649,39 @@ function refreshAllLiveViews() {
     }
 }
 
-function buildFullCloudPacket(op, extra = {}) {
-    ensureSyncMetaVersions();
-    const delMap = syncMeta.deletedUids || {};
-    const validAccounts = Object.values(accountsCache)
-        .filter(a => a && (a.isDev || !delMap[a.uid]))
-        .slice(0, 30)
-        .map(a => ({
-            ...packAccountForSync(a),
-            accVer: typeof a.accVer === 'number' ? a.accVer : syncMeta.wipeAllAccountsVer,
-            scoreVer: typeof a.scoreVer === 'number' ? a.scoreVer : syncMeta.wipeAllScoresVer,
-            indivScoreVer: typeof a.indivScoreVer === 'number' ? a.indivScoreVer : (syncMeta.resetScoreVer[a.uid] || 0),
-            editVer: typeof a.editVer === 'number' ? a.editVer : 1
-        }));
-
-    return {
-        type: 'rs_sync_v12',
-        pid: CLIENT_ID + '_' + Date.now().toString(36) + '_' + Math.floor(Math.random() * 1e5).toString(36),
-        sender: CLIENT_ID,
-        op,
-        meta: {
-            wipeAllAccountsVer: syncMeta.wipeAllAccountsVer,
-            wipeAllScoresVer: syncMeta.wipeAllScoresVer,
-            resetScoreVer: syncMeta.resetScoreVer,
-            deletedUids: syncMeta.deletedUids
-        },
-        seasonState: seasonStateCache,
-        accounts: validAccounts,
-        ...extra
-    };
+// Low-bandwidth Firebase REST helper
+async function fbRequest(path, method = 'GET', bodyObj = null, timeoutMs = 4500) {
+    if (!FB_BASE_URL) return null;
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+        const opts = { method, signal: ctrl.signal, cache: 'no-store' };
+        if (bodyObj !== null) {
+            opts.headers = { 'Content-Type': 'application/json' };
+            opts.body = JSON.stringify(bodyObj);
+        }
+        const res = await fetch(`${FB_BASE_URL}${path}.json`, opts);
+        if (!res.ok) return null;
+        return await res.json();
+    } catch (e) {
+        return null;
+    } finally {
+        clearTimeout(tid);
+    }
 }
 
-function publishRealtimeEvent(op, data = {}) {
+// Publishes delta changes to Firebase (only ~300 bytes per action!) + Local BroadcastChannel
+async function publishRealtimeEvent(op, data = {}) {
     ensureSyncMetaVersions();
+    const pid = CLIENT_ID + '_' + Date.now().toString(36) + '_' + Math.floor(Math.random() * 1e5).toString(36);
+    seenPacketIds.add(pid);
+    lastSeenPulsePid = pid;
+    if (seenPacketIds.size > 2000) seenPacketIds.clear();
 
     if (op === 'score_reset_all') {
         syncMeta.wipeAllScoresVer += 1;
         Object.values(accountsCache).forEach(a => { a.scoreVer = syncMeta.wipeAllScoresVer; });
-        saveSyncMeta();
-        saveAccountsCache();
+        saveSyncMeta(); saveAccountsCache();
     } else if (op === 'acc_delete_all') {
         syncMeta.wipeAllAccountsVer += 1;
         syncMeta.deletedUids = {};
@@ -646,18 +716,151 @@ function publishRealtimeEvent(op, data = {}) {
         }
     }
 
-    const packet = buildFullCloudPacket(op, data);
-    seenPacketIds.add(packet.pid);
-    if (seenPacketIds.size > 2000) seenPacketIds.clear();
+    // 1. Instant Same-Browser Tab Sync via BroadcastChannel
+    const localPacket = {
+        type: 'rs_sync_v12', pid, sender: CLIENT_ID, op,
+        meta: {
+            wipeAllAccountsVer: syncMeta.wipeAllAccountsVer,
+            wipeAllScoresVer: syncMeta.wipeAllScoresVer,
+            resetScoreVer: syncMeta.resetScoreVer,
+            deletedUids: syncMeta.deletedUids
+        },
+        seasonState: seasonStateCache,
+        accounts: data.acc ? [packAccountForSync(accountsCache[data.acc.uid] || data.acc)] : [],
+        ...data
+    };
+    if (localBc) { try { localBc.postMessage(localPacket); } catch (e) {} }
 
-    if (localBc) { try { localBc.postMessage(packet); } catch (e) {} }
-    fetch(RT_SYNC_URL_V12, { method: 'POST', body: JSON.stringify(packet) })
-        .then(() => setRealtimeStatusUI('live'))
-        .catch(() => {});
+    // 2. Quota-Safe Delta Sync to Firebase 24/7 Cloud DB
+    if (!FB_BASE_URL) {
+        setRealtimeStatusUI('local');
+        return;
+    }
+
+    try {
+        if (op === 'acc_upsert' && data.acc && data.acc.uid) {
+            const packed = packAccountForSync(accountsCache[data.acc.uid] || data.acc);
+            await fbRequest(`/accounts/${packed.uid}`, 'PUT', packed);
+            await fbRequest('/pulse', 'PUT', { pid, op, uid: packed.uid, ts: Date.now() });
+        } else if (op === 'score_record' && data.entry && data.entry.uid) {
+            const u = data.entry.uid;
+            if (accountsCache[u]) await fbRequest(`/accounts/${u}`, 'PUT', packAccountForSync(accountsCache[u]));
+            await fbRequest(`/leaderboards/alltime/${u}`, 'PUT', data.entry);
+            if (data.sNum && data.sScore > 0) {
+                await fbRequest(`/leaderboards/season/${data.sNum}/${u}`, 'PUT', { ...data.entry, score: data.sScore });
+            }
+            await fbRequest('/pulse', 'PUT', { pid, op, uid: u, sNum: data.sNum || 0, sScore: data.sScore || 0, ts: Date.now() });
+        } else if (op === 'acc_delete' && data.uid) {
+            await fbRequest(`/accounts/${data.uid}`, 'DELETE');
+            await fbRequest(`/leaderboards/alltime/${data.uid}`, 'DELETE');
+            await fbRequest(`/meta/deletedUids/${data.uid}`, 'PUT', true);
+            await fbRequest('/pulse', 'PUT', { pid, op, uid: data.uid, ts: Date.now() });
+        } else if (op === 'score_reset' && data.uid) {
+            const u = data.uid;
+            await fbRequest(`/leaderboards/alltime/${u}`, 'DELETE');
+            await fbRequest(`/leaderboards/season/${seasonStatusCache.seasonNum}/${u}`, 'DELETE');
+            if (accountsCache[u]) await fbRequest(`/accounts/${u}`, 'PUT', packAccountForSync(accountsCache[u]));
+            await fbRequest(`/meta/resetScoreVer/${u}`, 'PUT', syncMeta.resetScoreVer[u]);
+            await fbRequest('/pulse', 'PUT', { pid, op, uid: u, ts: Date.now() });
+        } else if (op === 'score_reset_all') {
+            await fbRequest('/leaderboards', 'DELETE');
+            await fbRequest('/meta/wipeAllScoresVer', 'PUT', syncMeta.wipeAllScoresVer);
+            await fbRequest('/pulse', 'PUT', { pid, op, wipeAllScoresVer: syncMeta.wipeAllScoresVer, ts: Date.now() });
+        } else if (op === 'acc_delete_all') {
+            const devPacked = packAccountForSync(accountsCache[CANONICAL_DEV_UID]);
+            await fbRequest('/accounts', 'PUT', { [CANONICAL_DEV_UID]: devPacked });
+            await fbRequest('/leaderboards', 'DELETE');
+            await fbRequest('/meta/wipeAllAccountsVer', 'PUT', syncMeta.wipeAllAccountsVer);
+            await fbRequest('/meta/deletedUids', 'DELETE');
+            await fbRequest('/pulse', 'PUT', { pid, op, wipeAllAccountsVer: syncMeta.wipeAllAccountsVer, ts: Date.now() });
+        } else if (op === 'mail_broadcast' && data.mail) {
+            await fbRequest('/meta/latestMail', 'PUT', data.mail);
+            await fbRequest('/pulse', 'PUT', { pid, op, mail: data.mail, ts: Date.now() });
+        } else if (op === 'season_sync') {
+            await fbRequest('/meta/seasonState', 'PUT', seasonStateCache);
+            await fbRequest('/pulse', 'PUT', { pid, op, seasonState: seasonStateCache, ts: Date.now() });
+        }
+        setRealtimeStatusUI('live');
+    } catch (e) {}
+}
+
+function mergeSingleAccountRecord(rawAcc, fromReplay = false) {
+    if (!rawAcc || !rawAcc.uid) return false;
+    ensureSyncMetaVersions();
+    const u = rawAcc.uid;
+    const remAccVer = typeof rawAcc.accVer === 'number' ? rawAcc.accVer : 0;
+
+    if (u !== CANONICAL_DEV_UID) {
+        if (remAccVer < syncMeta.wipeAllAccountsVer) return false;
+        if (syncMeta.deletedUids[u]) return false;
+    }
+
+    const inc = normalizeAccountRecord(rawAcc, u);
+    if (!inc) return false;
+
+    const remScoreVer = typeof rawAcc.scoreVer === 'number' ? rawAcc.scoreVer : 0;
+    const remIndivVer = typeof rawAcc.indivScoreVer === 'number' ? rawAcc.indivScoreVer : 0;
+    const curIndivVer = Number(syncMeta.resetScoreVer[u]) || 0;
+    const scoresValid = (remScoreVer >= syncMeta.wipeAllScoresVer) && (remIndivVer >= curIndivVer);
+
+    if (!scoresValid) {
+        inc.stats.allTimeBest = 0;
+        inc.stats.bestEpoch = 1;
+        inc.stats.totalFlashes = 0;
+        inc.stats.seasonScores = {};
+    }
+
+    const cur = accountsCache[u];
+    const remEditVer = Number(rawAcc.editVer) || 1;
+    const curEditVer = cur ? (Number(cur.editVer) || 0) : 0;
+
+    if (!cur) {
+        inc.accVer = syncMeta.wipeAllAccountsVer;
+        inc.scoreVer = syncMeta.wipeAllScoresVer;
+        inc.indivScoreVer = curIndivVer;
+        inc.editVer = remEditVer;
+        accountsCache[u] = inc;
+    } else {
+        if (remEditVer >= curEditVer) {
+            cur.name = inc.name;
+            cur.tag = inc.tag;
+            cur.custom = { ...cur.custom, ...inc.custom };
+            cur.editVer = remEditVer;
+        }
+        if (scoresValid) {
+            if (inc.stats.allTimeBest > (cur.stats.allTimeBest || 0)) cur.stats.allTimeBest = inc.stats.allTimeBest;
+            cur.stats.bestEpoch = Math.max(cur.stats.bestEpoch || 1, inc.stats.bestEpoch || 1);
+            cur.stats.totalFlashes = Math.max(cur.stats.totalFlashes || 0, inc.stats.totalFlashes || 0);
+            cur.stats.totalRuns = Math.max(cur.stats.totalRuns || 0, inc.stats.totalRuns || 0);
+            cur.stats.completedEpoch250 = Boolean(cur.stats.completedEpoch250 || inc.stats.completedEpoch250);
+            const curS = cur.stats.seasonScores || {}, incS = inc.stats.seasonScores || {};
+            Object.keys(incS).forEach(k => { curS[k] = Math.max(Number(curS[k]) || 0, Number(incS[k]) || 0); });
+            cur.stats.seasonScores = curS;
+        }
+        cur.accVer = syncMeta.wipeAllAccountsVer;
+        cur.scoreVer = syncMeta.wipeAllScoresVer;
+        cur.indivScoreVer = curIndivVer;
+        if (activeAccount && activeAccount.uid === u) activeAccount = cur;
+        syncAccountMetaInLeaderboards(cur);
+    }
+
+    const finalAcc = accountsCache[u];
+    if (scoresValid && finalAcc && finalAcc.stats.allTimeBest > 0) {
+        const sNum = seasonStatusCache.seasonNum;
+        const sScore = (finalAcc.stats.seasonScores && finalAcc.stats.seasonScores[sNum]) || 0;
+        mergeScoreEntryLocally({
+            uid: finalAcc.uid, name: finalAcc.name, tag: finalAcc.tag, isDev: finalAcc.isDev,
+            score: finalAcc.stats.allTimeBest, epoch: finalAcc.stats.bestEpoch,
+            accent: finalAcc.custom.bodySecondary, skinId: finalAcc.custom.nitroSkin,
+            isPrism: finalAcc.custom.nitroSkin === 'void_chroma', ts: Date.now()
+        }, sNum, sScore);
+    }
+    saveAccountsCache();
+    return true;
 }
 
 function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
-    if (!pkt || typeof pkt !== 'object' || pkt.type !== 'rs_sync_v12') return;
+    if (!pkt || typeof pkt !== 'object') return;
     if (pkt.pid) {
         if (seenPacketIds.has(pkt.pid)) return;
         seenPacketIds.add(pkt.pid);
@@ -667,7 +870,6 @@ function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
     let changed = false;
     const remMeta = pkt.meta || {};
 
-    // 1. Global Player Account Wipe (Version comparison — works regardless of device clocks!)
     if (Number(remMeta.wipeAllAccountsVer) > syncMeta.wipeAllAccountsVer) {
         syncMeta.wipeAllAccountsVer = Number(remMeta.wipeAllAccountsVer);
         syncMeta.deletedUids = {};
@@ -676,7 +878,6 @@ function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
         changed = true;
     }
 
-    // 2. Global Score Reset
     if (Number(remMeta.wipeAllScoresVer) > syncMeta.wipeAllScoresVer) {
         syncMeta.wipeAllScoresVer = Number(remMeta.wipeAllScoresVer);
         saveSyncMeta();
@@ -687,7 +888,6 @@ function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
         if (!fromReplay) showToast('⚡ Live DB: All scores reset.');
     }
 
-    // 3. Specific Deleted Accounts
     if (remMeta.deletedUids && typeof remMeta.deletedUids === 'object') {
         Object.keys(remMeta.deletedUids).forEach(u => {
             if (u !== CANONICAL_DEV_UID && remMeta.deletedUids[u] && !syncMeta.deletedUids[u]) {
@@ -699,110 +899,26 @@ function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
         });
     }
 
-    // 4. Specific Pilot Score Resets
     if (remMeta.resetScoreVer && typeof remMeta.resetScoreVer === 'object') {
         Object.entries(remMeta.resetScoreVer).forEach(([u, ver]) => {
-            const remV = Number(ver) || 0;
-            const curV = Number(syncMeta.resetScoreVer[u]) || 0;
+            const remV = Number(ver) || 0, curV = Number(syncMeta.resetScoreVer[u]) || 0;
             if (remV > curV) {
                 syncMeta.resetScoreVer[u] = remV;
                 saveSyncMeta();
                 applyScoreResetLocally(u);
-                if (accountsCache[u]) {
-                    accountsCache[u].indivScoreVer = remV;
-                    saveAccountsCache();
-                }
+                if (accountsCache[u]) { accountsCache[u].indivScoreVer = remV; saveAccountsCache(); }
                 changed = true;
                 if (!fromReplay) showToast('⚡ Live DB: Pilot score reset.');
             }
         });
     }
 
-    // 5. Merge Valid Accounts & Scores from Packet
     if (Array.isArray(pkt.accounts)) {
         pkt.accounts.forEach(rawAcc => {
-            if (!rawAcc || !rawAcc.uid) return;
-            const u = rawAcc.uid;
-            const remAccVer = typeof rawAcc.accVer === 'number' ? rawAcc.accVer : 0;
-
-            // Reject accounts from before a global account wipe or specifically deleted
-            if (u !== CANONICAL_DEV_UID) {
-                if (remAccVer < syncMeta.wipeAllAccountsVer) return;
-                if (syncMeta.deletedUids[u]) return;
-            }
-
-            const inc = normalizeAccountRecord(rawAcc, u);
-            if (!inc) return;
-
-            const remScoreVer = typeof rawAcc.scoreVer === 'number' ? rawAcc.scoreVer : 0;
-            const remIndivVer = typeof rawAcc.indivScoreVer === 'number' ? rawAcc.indivScoreVer : 0;
-            const curIndivVer = Number(syncMeta.resetScoreVer[u]) || 0;
-            const scoresValid = (remScoreVer >= syncMeta.wipeAllScoresVer) && (remIndivVer >= curIndivVer);
-
-            if (!scoresValid) {
-                inc.stats.allTimeBest = 0;
-                inc.stats.bestEpoch = 1;
-                inc.stats.totalFlashes = 0;
-                inc.stats.seasonScores = {};
-            }
-
-            const cur = accountsCache[u];
-            const remEditVer = Number(rawAcc.editVer) || 1;
-            const curEditVer = cur ? (Number(cur.editVer) || 0) : 0;
-
-            if (!cur) {
-                inc.accVer = syncMeta.wipeAllAccountsVer;
-                inc.scoreVer = syncMeta.wipeAllScoresVer;
-                inc.indivScoreVer = curIndivVer;
-                inc.editVer = remEditVer;
-                accountsCache[u] = inc;
-                saveAccountsCache();
-                changed = true;
-            } else {
-                if (remEditVer >= curEditVer) {
-                    cur.name = inc.name;
-                    cur.tag = inc.tag;
-                    cur.custom = { ...cur.custom, ...inc.custom };
-                    cur.editVer = remEditVer;
-                }
-                if (scoresValid) {
-                    if (inc.stats.allTimeBest > (cur.stats.allTimeBest || 0)) {
-                        cur.stats.allTimeBest = inc.stats.allTimeBest;
-                    }
-                    cur.stats.bestEpoch = Math.max(cur.stats.bestEpoch || 1, inc.stats.bestEpoch || 1);
-                    cur.stats.totalFlashes = Math.max(cur.stats.totalFlashes || 0, inc.stats.totalFlashes || 0);
-                    cur.stats.totalRuns = Math.max(cur.stats.totalRuns || 0, inc.stats.totalRuns || 0);
-                    cur.stats.completedEpoch250 = Boolean(cur.stats.completedEpoch250 || inc.stats.completedEpoch250);
-                    const curS = cur.stats.seasonScores || {}, incS = inc.stats.seasonScores || {};
-                    Object.keys(incS).forEach(k => {
-                        curS[k] = Math.max(Number(curS[k]) || 0, Number(incS[k]) || 0);
-                    });
-                    cur.stats.seasonScores = curS;
-                }
-                cur.accVer = syncMeta.wipeAllAccountsVer;
-                cur.scoreVer = syncMeta.wipeAllScoresVer;
-                cur.indivScoreVer = curIndivVer;
-                if (activeAccount && activeAccount.uid === u) activeAccount = cur;
-                syncAccountMetaInLeaderboards(cur);
-                saveAccountsCache();
-                changed = true;
-            }
-
-            const finalAcc = accountsCache[u];
-            if (scoresValid && finalAcc && finalAcc.stats.allTimeBest > 0) {
-                const sNum = seasonStatusCache.seasonNum;
-                const sScore = (finalAcc.stats.seasonScores && finalAcc.stats.seasonScores[sNum]) || 0;
-                mergeScoreEntryLocally({
-                    uid: finalAcc.uid, name: finalAcc.name, tag: finalAcc.tag, isDev: finalAcc.isDev,
-                    score: finalAcc.stats.allTimeBest, epoch: finalAcc.stats.bestEpoch,
-                    accent: finalAcc.custom.bodySecondary, skinId: finalAcc.custom.nitroSkin,
-                    isPrism: finalAcc.custom.nitroSkin === 'void_chroma', ts: Date.now()
-                }, sNum, sScore);
-            }
+            if (mergeSingleAccountRecord(rawAcc, fromReplay)) changed = true;
         });
     }
 
-    // 6. Broadcast Mail
     if (pkt.op === 'mail_broadcast' && pkt.mail && pkt.mail.title && pkt.mail.body) {
         Object.values(accountsCache).forEach(acc => {
             if (!(acc.inbox || []).some(m => m.id === pkt.mail.id)) {
@@ -815,7 +931,6 @@ function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
         if (!fromReplay && activeAccount) showToast(`📬 New Mail: ${pkt.mail.title}`, 'ok');
     }
 
-    // 7. Season Phase Sync
     if (pkt.seasonState && Number(pkt.seasonState.devOffsetMs) > (Number(seasonStateCache.devOffsetMs) || 0)) {
         seasonStateCache.originTs = Number(pkt.seasonState.originTs) || seasonStateCache.originTs;
         seasonStateCache.devOffsetMs = Number(pkt.seasonState.devOffsetMs) || 0;
@@ -827,13 +942,47 @@ function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
     if (changed) refreshAllLiveViews();
 }
 
-function enforceTombstonesLocally() {
-    ensureSyncMetaVersions();
-    Object.keys(syncMeta.deletedUids || {}).forEach(u => {
-        if (u !== CANONICAL_DEV_UID && syncMeta.deletedUids[u] && accountsCache[u]) {
-            applyAccountDeleteLocally(u, false);
+// Handles a tiny 80-byte Firebase Pulse notification by fetching ONLY the delta that changed!
+async function handleFirebasePulse(pulse) {
+    if (!pulse || !pulse.pid || pulse.pid === lastSeenPulsePid || seenPacketIds.has(pulse.pid)) return;
+    lastSeenPulsePid = pulse.pid;
+    seenPacketIds.add(pulse.pid);
+
+    const op = pulse.op;
+    if ((op === 'acc_upsert' || op === 'score_record') && pulse.uid) {
+        const remAcc = await fbRequest(`/accounts/${pulse.uid}`, 'GET');
+        if (remAcc && mergeSingleAccountRecord(remAcc, false)) refreshAllLiveViews();
+    } else if (op === 'acc_delete' && pulse.uid) {
+        syncMeta.deletedUids[pulse.uid] = true;
+        saveSyncMeta();
+        applyAccountDeleteLocally(pulse.uid, true);
+        refreshAllLiveViews();
+    } else if (op === 'score_reset' && pulse.uid) {
+        syncMeta.resetScoreVer[pulse.uid] = (Number(syncMeta.resetScoreVer[pulse.uid]) || 0) + 1;
+        saveSyncMeta();
+        applyScoreResetLocally(pulse.uid);
+        refreshAllLiveViews();
+    } else if (op === 'score_reset_all') {
+        if (Number(pulse.wipeAllScoresVer) > syncMeta.wipeAllScoresVer) {
+            syncMeta.wipeAllScoresVer = Number(pulse.wipeAllScoresVer);
+            saveSyncMeta();
         }
-    });
+        applyResetAllScoresLocally();
+        refreshAllLiveViews();
+        showToast('⚡ Live DB: All scores reset.');
+    } else if (op === 'acc_delete_all') {
+        if (Number(pulse.wipeAllAccountsVer) > syncMeta.wipeAllAccountsVer) {
+            syncMeta.wipeAllAccountsVer = Number(pulse.wipeAllAccountsVer);
+            syncMeta.deletedUids = {};
+            saveSyncMeta();
+        }
+        applyDeleteAllNonDevLocally(0, true, true);
+        refreshAllLiveViews();
+    } else if (op === 'mail_broadcast' && pulse.mail) {
+        applyIncomingRealtimeEvent({ type: 'rs_sync_v12', pid: pulse.pid, op: 'mail_broadcast', mail: pulse.mail }, false);
+    } else if (op === 'season_sync' && pulse.seasonState) {
+        applyIncomingRealtimeEvent({ type: 'rs_sync_v12', pid: pulse.pid, op: 'season_sync', seasonState: pulse.seasonState }, false);
+    }
 }
 
 function mergeScoreEntryLocally(entry, sNum, sScore) {
@@ -901,71 +1050,83 @@ function applyDeleteAllNonDevLocally(wipeTs, notify, forceAll = true) {
     if (notify && removed > 0) showToast(`⚡ Live DB: Wiped ${removed} player account(s).`);
 }
 
-// Exact same 24h poll transport as your working original model
+// Initial Bootstrap Pull from Firebase (runs once on boot or manual sync)
 async function pullCloudHistoryAndSync(sendPushAfter = false) {
+    if (!FB_BASE_URL) {
+        setRealtimeStatusUI('local');
+        return;
+    }
     if (isPullingCloud || document.hidden || isPortalExiting) return;
     isPullingCloud = true;
-    const ctrl = new AbortController();
-    const tid = setTimeout(() => ctrl.abort(), 3200);
     try {
-        const res = await fetch(`${RT_SYNC_URL_V12}/json?poll=1&since=24h`, { signal: ctrl.signal, cache: 'no-store' });
-        if (res.ok) {
-            const text = await res.text();
-            for (const line of text.trim().split('\n')) {
-                if (!line) continue;
-                try {
-                    const w = JSON.parse(line);
-                    if (w && w.event === 'message' && w.message) {
-                        const pkt = JSON.parse(w.message);
-                        if (pkt && pkt.type === 'rs_sync_v12') applyIncomingRealtimeEvent(pkt, true);
-                    }
-                } catch (e) {}
+        const snap = await fbRequest('', 'GET', null, 6000);
+        if (snap && typeof snap === 'object') {
+            if (snap.pulse && snap.pulse.pid) {
+                lastSeenPulsePid = snap.pulse.pid;
+                seenPacketIds.add(snap.pulse.pid);
             }
-            setRealtimeStatusUI('live');
-            if (sendPushAfter) publishRealtimeEvent('state_sync');
+            const remAccounts = snap.accounts && typeof snap.accounts === 'object' ? Object.values(snap.accounts) : [];
+            const remMeta = snap.meta || {};
+            applyIncomingRealtimeEvent({
+                type: 'rs_sync_v12',
+                pid: 'boot_' + Date.now(),
+                op: remMeta.latestMail ? 'mail_broadcast' : 'state_sync',
+                meta: remMeta,
+                seasonState: remMeta.seasonState || null,
+                mail: remMeta.latestMail || null,
+                accounts: remAccounts
+            }, true);
+        }
+        setRealtimeStatusUI('live');
+        if (sendPushAfter && activeAccount) {
+            await fbRequest(`/accounts/${activeAccount.uid}`, 'PUT', packAccountForSync(activeAccount));
         }
     } catch (e) {
-        setRealtimeStatusUI('offline');
+        setRealtimeStatusUI('local');
     } finally {
-        clearTimeout(tid);
         isPullingCloud = false;
     }
 }
 
-// Exact same live /sse stream transport (without ?since=all) as your working original model
+// Connects to Firebase's tiny 80-byte /pulse.json via SSE stream + quota-safe fallback check
 function connectRealtimeStream() {
     if (isPortalExiting) return;
+    if (!FB_BASE_URL) {
+        setRealtimeStatusUI('local');
+        return;
+    }
     if (!rtPollTimer) {
-        rtPollTimer = setInterval(() => {
-            if (!isPortalExiting && !document.hidden) pullCloudHistoryAndSync(false);
-        }, 3500);
+        rtPollTimer = setInterval(async () => {
+            if (isPortalExiting || document.hidden || !FB_BASE_URL) return;
+            const pulse = await fbRequest('/pulse', 'GET', null, 3000);
+            if (pulse && pulse.pid && pulse.pid !== lastSeenPulsePid) {
+                await handleFirebasePulse(pulse);
+            }
+        }, 10000);
     }
     if (typeof EventSource === 'undefined') return;
     if (rtEventSource) { try { rtEventSource.close(); } catch (e) {} rtEventSource = null; }
     try {
-        rtEventSource = new EventSource(`${RT_SYNC_URL_V12}/sse`);
+        rtEventSource = new EventSource(`${FB_BASE_URL}/pulse.json`);
         rtEventSource.onopen = () => setRealtimeStatusUI('live');
-        rtEventSource.onmessage = ev => {
+        rtEventSource.addEventListener('put', ev => {
             try {
-                const data = JSON.parse(ev.data);
-                if (data && data.message) {
-                    const pkt = JSON.parse(data.message);
-                    if (pkt && pkt.type === 'rs_sync_v12') applyIncomingRealtimeEvent(pkt, false);
-                }
+                const payload = JSON.parse(ev.data);
+                if (payload && payload.data) handleFirebasePulse(payload.data);
             } catch (e) {}
-        };
+        });
         rtEventSource.onerror = () => {
             try { rtEventSource.close(); } catch (e) {}
             rtEventSource = null;
             if (rtReconnectTimer) clearTimeout(rtReconnectTimer);
-            rtReconnectTimer = setTimeout(connectRealtimeStream, 5000);
+            rtReconnectTimer = setTimeout(connectRealtimeStream, 8000);
         };
     } catch (e) {}
 }
 
 function forceManualCloudSync() {
     pullCloudHistoryAndSync(true);
-    showToast('Syncing Realtime DB...', 'info');
+    showToast(FB_BASE_URL ? 'Syncing Firebase 24/7 DB...' : 'Synced Local IndexedDB.', 'info');
     playSfx('uiClick');
 }
 
@@ -987,6 +1148,7 @@ window.addEventListener('storage', ev => {
         refreshAllLiveViews();
     }
 });
+
 // =========================================================================
 // 8. ALL-TIME #1 CHAMPION, SEASON LIFECYCLE & LEADERBOARD RECORDING
 // =========================================================================
@@ -1109,7 +1271,6 @@ function recordScoreToLeaderboards(acc, scoreVal, epochVal) {
     mergeScoreEntryLocally(entry, sNum, sScore);
     reconcileAllTimeChampion(); updateTopLeaderBanner();
     publishRealtimeEvent('score_record', { entry, sNum, sScore });
-    publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(acc) });
 }
 function removeUidFromLeaderboards(uid) {
     lbAllCache = lbAllCache.filter(e => e.uid !== uid); saveLbAll();
@@ -1118,7 +1279,7 @@ function removeUidFromLeaderboards(uid) {
 }
 
 // =========================================================================
-// 9. AUDIO ENGINE
+// 9. AUDIO ENGINE & INDEXEDDB ARRAYBUFFER SONG STORAGE
 // =========================================================================
 let audioCtx = null, compressorNode = null, masterGain = null, musicBus = null, sfxBus = null;
 let engineOsc1 = null, engineOsc2 = null, engineSub = null, engineTurbo = null, engineFilter = null, engineGain = null, engineTurboGain = null, engineLfo = null, engineLfoGain = null;
@@ -1140,7 +1301,7 @@ mitadruAudio.addEventListener('error', () => {
 });
 
 const customAudio = new Audio(); customAudio.loop = true;
-let customSongObjUrl = null, songsDbPromise = null;
+let customSongObjUrl = null;
 
 function isAppAudible() { return document.visibilityState !== 'hidden' && !document.hidden && !isPortalExiting; }
 function safeGain(v) { return Number.isFinite(v) ? Math.max(0.0005, Math.min(1.5, v)) : 0.0005; }
@@ -1395,32 +1556,31 @@ function unlockAudioFromUserGesture(e) {
 }
 ['click', 'touchend', 'keydown'].forEach(evt => window.addEventListener(evt, unlockAudioFromUserGesture, { capture: true, passive: true }));
 
-function openSongsIDB() {
-    if (!('indexedDB' in window)) return Promise.reject(new Error('IndexedDB unavailable'));
-    if (songsDbPromise) return songsDbPromise;
-    songsDbPromise = new Promise((res, rej) => {
-        const r = indexedDB.open(CUSTOM_SONGS_DB_NAME, 1);
-        r.onupgradeneeded = e => { const db = e.target.result; if (!db.objectStoreNames.contains('songs')) db.createObjectStore('songs', { keyPath: 'uid' }); };
-        r.onsuccess = () => res(r.result);
-        r.onerror = () => { songsDbPromise = null; rej(r.error); };
-        r.onblocked = () => { songsDbPromise = null; rej(new Error('IDB blocked')); };
-    });
-    return songsDbPromise;
-}
+// Stores ArrayBuffer + mimeType in IndexedDB so iOS Safari, Android, and PC all play uploaded songs reliably!
 async function handleCustomSongUpload(files) {
     if (!activeAccount || !files || !files[0]) return;
     const f = files[0], inp = document.getElementById('customSongFileInput');
     if (inp) inp.value = '';
     if (f.size > 20 * 1024 * 1024) { setTextCached('customSongStatusText', '✕ Exceeds 20 MB'); showToast('Track exceeds 20 MB limit.', 'err'); playSfx('hit'); return; }
     try {
-        const db = await openSongsIDB();
+        const arrayBuf = await f.arrayBuffer();
+        const mimeType = f.type || 'audio/mpeg';
+        const db = await openLocalIDB();
         await new Promise((res, rej) => {
             const tx = db.transaction('songs', 'readwrite');
-            tx.objectStore('songs').put({ uid: activeAccount.uid, pilotName: `${activeAccount.name} #${activeAccount.tag}`, fileName: f.name, sizeBytes: f.size, blob: f, ts: Date.now() });
+            tx.objectStore('songs').put({
+                uid: activeAccount.uid,
+                pilotName: `${activeAccount.name} #${activeAccount.tag}`,
+                fileName: f.name,
+                sizeBytes: f.size,
+                mimeType,
+                buffer: arrayBuf,
+                ts: Date.now()
+            });
             tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
         });
         await loadCustomSongForActiveAccount(); selectOstMode('custom');
-        showToast(`Loaded track: ${f.name}`, 'ok'); playSfx('pickup');
+        showToast(`Loaded track into IndexedDB: ${f.name}`, 'ok'); playSfx('pickup');
     } catch (e) { setTextCached('customSongStatusText', '✕ Upload failed'); showToast('Track upload failed.', 'err'); }
 }
 async function loadCustomSongForActiveAccount() {
@@ -1432,10 +1592,11 @@ async function loadCustomSongForActiveAccount() {
         return;
     }
     try {
-        const db = await openSongsIDB();
+        const db = await openLocalIDB();
         const rec = await new Promise(res => { const req = db.transaction('songs', 'readonly').objectStore('songs').get(activeAccount.uid); req.onsuccess = () => res(req.result || null); req.onerror = () => res(null); });
-        if (rec && rec.blob) {
-            customSongObjUrl = URL.createObjectURL(rec.blob);
+        if (rec && (rec.buffer || rec.blob)) {
+            const blobObj = rec.buffer ? new Blob([rec.buffer], { type: rec.mimeType || 'audio/mpeg' }) : rec.blob;
+            customSongObjUrl = URL.createObjectURL(blobObj);
             customAudio.src = customSongObjUrl; customAudio.loop = true;
             if (stEl) stEl.innerText = `✓ ${rec.fileName} (${(rec.sizeBytes / 1048576).toFixed(1)} MB)`;
             if (subEl) subEl.innerText = rec.fileName; if (rmBtn) rmBtn.classList.remove('hidden');
@@ -1450,7 +1611,7 @@ async function loadCustomSongForActiveAccount() {
 async function removeCurrentPilotCustomSong() { if (activeAccount) { await deleteCustomSongByUid(activeAccount.uid); showToast('Custom track removed.'); playSfx('uiClick'); } }
 async function deleteCustomSongByUid(uid) {
     try {
-        const db = await openSongsIDB();
+        const db = await openLocalIDB();
         await new Promise(res => { const tx = db.transaction('songs', 'readwrite'); tx.objectStore('songs').delete(uid); tx.oncomplete = () => res(); tx.onerror = () => res(); });
         if (activeAccount && activeAccount.uid === uid) await loadCustomSongForActiveAccount(); else renderDevCustomSongsList();
     } catch (e) {}
@@ -1460,7 +1621,7 @@ async function devRemoveAllCustomSongs() {
     const ok = await askConfirm({ title: 'Clear All Custom Songs?', body: 'Remove every uploaded custom audio track from IndexedDB?', okLabel: 'Clear All' });
     if (!ok) return;
     try {
-        const db = await openSongsIDB();
+        const db = await openLocalIDB();
         await new Promise(res => { const tx = db.transaction('songs', 'readwrite'); tx.objectStore('songs').clear(); tx.oncomplete = () => res(); });
         await loadCustomSongForActiveAccount();
         showDevFeedback('✓ All custom songs cleared.'); showToast('All custom songs cleared.', 'ok'); playSfx('pickup');
@@ -1470,7 +1631,7 @@ async function renderDevCustomSongsList() {
     const el = document.getElementById('devCustomSongsList');
     if (!el || !activeAccount || !activeAccount.isDev) return;
     try {
-        const db = await openSongsIDB();
+        const db = await openLocalIDB();
         const list = await new Promise(res => { const req = db.transaction('songs', 'readonly').objectStore('songs').getAll(); req.onsuccess = () => res(req.result || []); req.onerror = () => res([]); });
         if (!list.length) { el.innerHTML = '<div style="color:var(--text-dim);">None</div>'; return; }
         el.innerHTML = list.map(r => `<div class="row-between recessed-well" style="padding:4px 8px;"><span class="truncate mono">${escapeHtml(r.pilotName)}: <strong>${escapeHtml(r.fileName)}</strong></span><button type="button" class="btn btn-xs btn-danger" onclick="deleteCustomSongByUid('${escapeHtml(r.uid)}')">✕</button></div>`).join('');
@@ -1809,7 +1970,7 @@ function triggerGameOver() {
 }
 
 // =========================================================================
-// 11. RENDERER (CAR ALWAYS SHAKING + CIRCLE ALWAYS UNDERNEATH, INTENSIFIES ON NITRO)
+// 11. RENDERER
 // =========================================================================
 function ensureCachedBiomeGradients(W, H, horizonY, theme) {
     const key = `${W}_${H}_${biomeIdx}`;
@@ -2085,16 +2246,12 @@ function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cu
     const boostCol = cust.boostColor || '#fbbf24';
     const voidHue = (now * 0.16) % 360;
 
-    // =========================================================================
-    // 1. ALWAYS-PRESENT UNDER-CAR ORBITAL ENERGY CIRCLE (INTENSIFIES ON NITRO!)
-    // =========================================================================
     const ringPulse = 1.0 + Math.sin(now * (isBoosting ? 0.018 : 0.007)) * (isBoosting ? 0.15 : 0.075);
     const ringR = halfW * (isBoosting ? 1.64 : 1.38) * ringPulse;
     const ringRY = Math.max(7.5, halfW * (isBoosting ? 0.28 : 0.235)) * ringPulse;
     const ringPrimaryCol = chroma.isAllInOne ? chroma.empPrimary : boostCol;
     const ringSecCol = chroma.isAllInOne ? secGlowCol : borderGlowCol;
 
-    // Road Underglow inside the circle (Using safe colorWithAlpha so hsl/hex never throws DOMException!)
     const ugR = Math.max(10, halfW * (isBoosting ? 1.68 : 1.40));
     const ug = tCtx.createRadialGradient(carCenterX, rearY + 3, 3, carCenterX, rearY + 3, ugR);
     ug.addColorStop(0, chroma.underglow);
@@ -2111,7 +2268,6 @@ function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cu
         tCtx.shadowColor = ringPrimaryCol;
     }
 
-    // Main Orbital Energy Circle (ALWAYS PRESENT in both Non-Nitro and Nitro states)
     tCtx.strokeStyle = ringPrimaryCol;
     tCtx.globalAlpha = isBoosting ? 0.94 : 0.72;
     tCtx.lineWidth = isBoosting ? 2.8 : 2.0;
@@ -2119,7 +2275,6 @@ function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cu
     tCtx.ellipse(carCenterX, rearY + 3, ringR, ringRY, 0, 0, Math.PI * 2);
     tCtx.stroke();
 
-    // Outer High-Velocity Shockwave Ring when Nitro is ON
     if (isBoosting) {
         tCtx.strokeStyle = chroma.isAllInOne ? secGlowCol : '#ffffff';
         tCtx.globalAlpha = 0.58;
@@ -2129,7 +2284,6 @@ function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cu
         tCtx.stroke();
     }
 
-    // Counter-Rotating Inner Plasma Arcs (Always spinning, faster when Nitro is ON)
     const arcSpeed = isBoosting ? 0.015 : 0.0065;
     const arcStart1 = now * arcSpeed;
     const arcStart2 = -now * (arcSpeed * 0.85) + Math.PI;
@@ -2149,7 +2303,6 @@ function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cu
     tCtx.ellipse(carCenterX, rearY + 3, ringR * 0.68, ringRY * 0.68, 0, arcStart2, arcStart2 + 2.25);
     tCtx.stroke();
 
-    // Orbiting Energy Nodes on the Circle Perimeter (2 in Non-Nitro, 4 in Nitro)
     const nodeCount = isBoosting ? 4 : 2;
     for (let n = 0; n < nodeCount; n++) {
         const na = arcStart1 * 1.15 + (n / nodeCount) * Math.PI * 2;
@@ -2163,27 +2316,14 @@ function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cu
     }
     tCtx.restore();
 
-    // Ground Contact Shadow
     tCtx.fillStyle = 'rgba(0,0,0,0.80)';
     tCtx.beginPath();
     tCtx.ellipse(carCenterX, rearY + 3, halfW * 0.98, 6, 0, 0, Math.PI * 2);
     tCtx.fill();
 
-    // =========================================================================
-    // 2. ALWAYS-ACTIVE CAR ENGINE VIBRATION / SHAKE (INTENSIFIES ON NITRO!)
-    // =========================================================================
-    // =========================================================================
-    // 2. CAR SHAKE ONLY WHEN NITRO IS ON
-    // =========================================================================
-    const vibX = isBoosting
-        ? (Math.sin(now * 0.135) * 2.45 + Math.cos(now * 0.188) * 1.55)
-        : 0;
-    const vibY = isBoosting
-        ? (Math.sin(now * 0.028) * 2.35 + Math.cos(now * 0.148) * 1.75)
-        : 0;
-    const vibRoll = isBoosting
-        ? (Math.sin(now * 0.095) * 0.022)
-        : 0;
+    const vibX = isBoosting ? (Math.sin(now * 0.135) * 2.45 + Math.cos(now * 0.188) * 1.55) : 0;
+    const vibY = isBoosting ? (Math.sin(now * 0.028) * 2.35 + Math.cos(now * 0.148) * 1.75) : 0;
+    const vibRoll = isBoosting ? (Math.sin(now * 0.095) * 0.022) : 0;
 
     tCtx.save();
     tCtx.translate(carCenterX + vibX, rearY + vibY);
@@ -2193,14 +2333,12 @@ function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cu
     const diffuserBotY = rearY, fasciaTopY = rearY - Math.round(carH * 0.34), shoulderY = rearY - Math.round(carH * 0.56), roofTopY = rearY - carH;
     const shoulderHalfW = Math.round(halfW * 0.96), roofHalfW = Math.round(halfW * 0.56), hoodHalfW = Math.round(halfW * 0.44);
 
-    // Performance Tires
     const tireW = Math.max(9, Math.round(halfW * 0.26)), tireH = Math.max(13, Math.round(carH * 0.36));
     tCtx.fillStyle = '#04060a'; tCtx.strokeStyle = chroma.isAllInOne ? borderGlowCol : colorWithAlpha(borderGlowCol, 0.53); tCtx.lineWidth = 1.3;
     tCtx.beginPath(); tCtx.roundRect(carCenterX - halfW - 2, diffuserBotY - tireH + 3, tireW, tireH, 3); tCtx.roundRect(carCenterX + halfW - tireW + 2, diffuserBotY - tireH + 3, tireW, tireH, 3); tCtx.fill(); tCtx.stroke();
 
     if (allowBloom) { tCtx.shadowBlur = isMobileHardware ? 13 : (skin === 'void_chroma' ? 22 : 18); tCtx.shadowColor = borderGlowCol; }
 
-    // Chassis Body
     const bodyGrad = tCtx.createLinearGradient(carCenterX - halfW * 0.5, roofTopY, carCenterX + halfW * 0.5, diffuserBotY);
     if (chroma.isAllInOne) { bodyGrad.addColorStop(0, '#0a0f1c'); bodyGrad.addColorStop(0.32, chroma.bodyTint); bodyGrad.addColorStop(0.66, chroma.bodyMidTint); bodyGrad.addColorStop(1, '#070a12'); }
     else { bodyGrad.addColorStop(0, primary); bodyGrad.addColorStop(0.45, chroma.bodyTint); bodyGrad.addColorStop(1, '#080c15'); }
@@ -2214,7 +2352,6 @@ function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cu
     tCtx.quadraticCurveTo(carCenterX + halfW + 4, fasciaTopY + 4, carCenterX + halfW - 2, diffuserBotY - 3);
     tCtx.closePath(); tCtx.fill(); tCtx.stroke(); tCtx.shadowBlur = 0;
 
-    // Skin-Specific Body Aura Accents
     if (skin === 'void_chroma') {
         tCtx.save(); tCtx.strokeStyle = `hsla(${(voidHue + 180) % 360},100%,70%,0.55)`; tCtx.lineWidth = 1.4;
         tCtx.beginPath(); tCtx.ellipse(carCenterX, shoulderY + 4, halfW * 1.06, carH * 0.40, Math.sin(now * 0.0025) * 0.08, 0, Math.PI * 2); tCtx.stroke(); tCtx.restore();
@@ -2233,7 +2370,6 @@ function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cu
         tCtx.beginPath(); tCtx.moveTo(carCenterX - shoulderHalfW * 0.78, shoulderY + 2); tCtx.lineTo(carCenterX + hoodLeadX * 0.35, roofTopY + carH * 0.26); tCtx.lineTo(carCenterX + shoulderHalfW * 0.78, shoulderY + 2); tCtx.stroke(); tCtx.restore();
     }
 
-    // Aero Mirrors
     tCtx.fillStyle = primary; tCtx.strokeStyle = borderGlowCol; tCtx.lineWidth = 1.25;
     const mirrorY = shoulderY - Math.round(carH * 0.16), mCX = carCenterX + Math.round(hoodLeadX * 0.45);
     tCtx.beginPath();
@@ -2241,7 +2377,6 @@ function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cu
     tCtx.moveTo(mCX + roofHalfW * 1.10, mirrorY); tCtx.lineTo(mCX + roofHalfW * 1.28, mirrorY - 2); tCtx.lineTo(mCX + roofHalfW * 1.18, mirrorY + 3); tCtx.closePath();
     tCtx.fill(); tCtx.stroke();
 
-    // Canopy Glass + Reflection
     const glassGrad = tCtx.createLinearGradient(carCenterX, roofTopY + 2, carCenterX, shoulderY + 4);
     glassGrad.addColorStop(0, chroma.canopyTop); glassGrad.addColorStop(0.55, chroma.canopyMid); glassGrad.addColorStop(1, '#060911');
     tCtx.fillStyle = glassGrad; tCtx.strokeStyle = chroma.isAllInOne ? secGlowCol : colorWithAlpha(borderGlowCol, 0.67); tCtx.lineWidth = 1.35;
@@ -2252,16 +2387,13 @@ function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cu
     tCtx.strokeStyle = 'rgba(255,255,255,0.36)'; tCtx.lineWidth = 1.1;
     tCtx.beginPath(); tCtx.moveTo(carCenterX + hoodLeadX * 0.55 - roofHalfW * 0.68, roofTopY + Math.round(carH * 0.18)); tCtx.quadraticCurveTo(carCenterX + hoodLeadX * 0.55, roofTopY + Math.round(carH * 0.15), carCenterX + hoodLeadX * 0.55 + roofHalfW * 0.68, roofTopY + Math.round(carH * 0.18)); tCtx.stroke();
 
-    // Shoulder Creases
     tCtx.strokeStyle = chroma.isAllInOne ? borderGlowCol : colorWithAlpha(borderGlowCol, 0.73); tCtx.lineWidth = 1.3;
     tCtx.beginPath(); tCtx.moveTo(carCenterX - shoulderHalfW + 2, shoulderY); tCtx.quadraticCurveTo(carCenterX - halfW * 0.68, fasciaTopY - 4, carCenterX - halfW * 0.42, fasciaTopY); tCtx.moveTo(carCenterX + shoulderHalfW - 2, shoulderY); tCtx.quadraticCurveTo(carCenterX + halfW * 0.68, fasciaTopY - 4, carCenterX + halfW * 0.42, fasciaTopY); tCtx.stroke();
 
-    // Active Rear Wing
     const wingLift = isBraking ? 6 : (isBoosting ? 4.5 : 0.8), wingY = fasciaTopY - 2 - wingLift, wingW = Math.round(shoulderHalfW * 0.94);
     tCtx.fillStyle = '#070b14'; tCtx.strokeStyle = borderGlowCol; tCtx.lineWidth = 1.6;
     tCtx.beginPath(); tCtx.moveTo(carCenterX - wingW, wingY + 2); tCtx.quadraticCurveTo(carCenterX, wingY - 2, carCenterX + wingW, wingY + 2); tCtx.lineTo(carCenterX + wingW - 3, wingY + 5); tCtx.quadraticCurveTo(carCenterX, wingY + 2, carCenterX - wingW + 3, wingY + 5); tCtx.closePath(); tCtx.fill(); tCtx.stroke();
 
-    // Rear Fascia & Tail Light Blades
     const fasciaW = Math.round(halfW * 0.90), fasciaH = Math.max(10, diffuserBotY - fasciaTopY - 3);
     tCtx.fillStyle = '#05070e'; tCtx.strokeStyle = chroma.isAllInOne ? secGlowCol : '#1e293b'; tCtx.lineWidth = 1.25;
     tCtx.beginPath(); tCtx.roundRect(carCenterX - fasciaW, fasciaTopY, fasciaW * 2, fasciaH, 4); tCtx.fill(); tCtx.stroke();
@@ -2272,7 +2404,6 @@ function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cu
     const bladeW = Math.round(fasciaW * 0.42), bladeY = fasciaTopY + 2;
     tCtx.beginPath(); tCtx.roundRect(carCenterX - fasciaW + 3, bladeY, bladeW, 3.5, 2); tCtx.roundRect(carCenterX + fasciaW - bladeW - 3, bladeY, bladeW, 3.5, 2); tCtx.roundRect(carCenterX - 4, bladeY + 0.5, 8, 2.5, 1); tCtx.fill(); tCtx.shadowBlur = 0;
 
-    // Diffuser Fins & Thruster Nozzles
     const diffY = diffuserBotY - 8;
     tCtx.strokeStyle = chroma.isAllInOne ? borderGlowCol : colorWithAlpha(borderGlowCol, 0.53); tCtx.lineWidth = 1.25;
     tCtx.beginPath(); [-0.55, -0.25, 0.25, 0.55].forEach(r => { const sx = carCenterX + Math.round(fasciaW * r); tCtx.moveTo(sx, diffY); tCtx.lineTo(sx, diffuserBotY - 2); }); tCtx.stroke();
@@ -2281,7 +2412,6 @@ function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cu
     tCtx.fillStyle = '#090d16'; tCtx.strokeStyle = isBoosting ? (chroma.isAllInOne ? borderGlowCol : boostCol) : borderGlowCol; tCtx.lineWidth = 1.45;
     tCtx.beginPath(); tCtx.roundRect(leftNozX - 6, diffY + 1, 12, 4.5, 2); tCtx.roundRect(rightNozX - 6, diffY + 1, 12, 4.5, 2); tCtx.roundRect(carCenterX - 8, diffY + 1, 16, 5, 2); tCtx.fill(); tCtx.stroke();
 
-    // Idle Thruster Pilot Glow when Nitro is OFF; Full Afterburner Flames when Nitro is ON
     if (!isBoosting) {
         const idlePulse = 0.65 + Math.sin(now * 0.03) * 0.25;
         tCtx.save();
@@ -2636,7 +2766,7 @@ function renderMiniRadar(now = performance.now()) {
 }
 
 // =========================================================================
-// 12. PRIVACY CLICK-TO-REVEAL, AUTH & STRICT SIGNED-OUT LOCKDOWN
+// 12. PRIVACY CLICK-TO-REVEAL, AUTH & ON-DEMAND FIREBASE UID SIGN-IN
 // =========================================================================
 function resetAllRevealStates() { Object.keys(revealState).forEach(k => { revealState[k] = false; }); }
 function toggleRevealField(key) { if (!(key in revealState)) return; revealState[key] = !revealState[key]; refreshMenuAccountUI(); playSfx('uiClick'); }
@@ -2673,10 +2803,18 @@ function createNewPilotAccount() {
     showToast(`Pilot created & synced live: ${acc.name}`, 'ok'); playSfx('pickup');
 }
 
-function signInWithUid() {
+// Direct On-Demand UID Lookup from Firebase if UID isn't cached locally yet!
+async function signInWithUid() {
     const inp = document.getElementById('loginUidInput'), uid = (inp.value || '').replace(/\D+/g, '');
     if (!/^\d{17}$/.test(uid)) { showAuthFeedback('Enter a valid 17-digit UID.', false); playSfx('hit'); return; }
-    if (!accountsCache[uid]) { showAuthFeedback('UID not found. Wait a moment for Live DB sync or create a pilot.', false); playSfx('hit'); return; }
+    if (!accountsCache[uid] && FB_BASE_URL) {
+        showAuthFeedback('Looking up 17-digit UID in Firebase Cloud DB...', true);
+        const remAcc = await fbRequest(`/accounts/${uid}`, 'GET', null, 4500);
+        if (remAcc && remAcc.uid === uid) {
+            mergeSingleAccountRecord(remAcc, true);
+        }
+    }
+    if (!accountsCache[uid]) { showAuthFeedback('UID not found. Check your 17-digit UID or create a new pilot.', false); playSfx('hit'); return; }
     inp.value = '';
     activateAccountSession(uid);
     showToast(`Signed in as ${activeAccount.name}`, 'ok'); playSfx('pickup');
@@ -2818,7 +2956,7 @@ async function deleteAccountByUid(uid, askDevConfirm = true) {
         if (!ok) return;
     }
     const now = Date.now();
-    syncMeta.deletedUids[uid] = now; saveSyncMeta();
+    syncMeta.deletedUids[uid] = true; saveSyncMeta();
     applyAccountDeleteLocally(uid, false);
     publishRealtimeEvent('acc_delete', { uid, ts: now });
     renderDevAccountsList();
@@ -2969,7 +3107,7 @@ function setCustomVehicleColor(ch, hex) {
     saveAccountsCache(); syncAccountMetaInLeaderboards(activeAccount);
     buildGarageUI(); refreshMenuAccountUI();
     if (colorSyncDebounceTimer) clearTimeout(colorSyncDebounceTimer);
-    colorSyncDebounceTimer = setTimeout(() => { if (activeAccount) publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(activeAccount) }); }, 450);
+    colorSyncDebounceTimer = setTimeout(() => { if (activeAccount) publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(activeAccount) }); }, 1200);
 }
 function applyGaragePreset(k) {
     if (!activeAccount || !GARAGE_PRESETS[k]) return;
@@ -3118,7 +3256,7 @@ function setVisualFilter(fc, save = true) {
 }
 function resetGraphicsSettingsOnly() { globalSettings.graphics = getDefaultGlobalSettings().graphics; applyGraphicsPreset('medium'); setVisualFilter('filter-standard'); }
 
-// CONTROLS (PC shows Keyboard Keybinds; Mobile shows Mobile Paddles / Tap Lane / Gyro)
+// CONTROLS
 function buildKeybindGridUI() {
     const it = [{ k: 'left', l: 'LEFT' }, { k: 'right', l: 'RIGHT' }, { k: 'nitro', l: 'NITRO' }, { k: 'brake', l: 'BRAKE' }, { k: 'emp', l: 'EMP' }, { k: 'hideui', l: 'HUD' }];
     document.getElementById('pcKeybindGrid').innerHTML = it.map(x => `<button type="button" class="recessed-well" style="padding:7px 9px;text-align:left;cursor:pointer;" onclick="startKeyRebind('${x.k}')"><div style="font-size:8.5px;color:var(--text-dim);">${x.l}</div><div id="bindVal_${x.k}" style="font-size:11px;font-weight:700;color:#7dd3fc;margin-top:2px;"></div></button>`).join('');
@@ -3479,10 +3617,11 @@ Object.assign(window, {
 });
 
 // =========================================================================
-// 15. BOOT, REALTIME DB & FAIL-SAFE 60/120FPS LOOP
+// 15. BOOT, HYBRID INDEXEDDB + FIREBASE DB & FAIL-SAFE 60/120FPS LOOP
 // =========================================================================
 detectDeviceHardware();
 validateAndSanitizeDatabase();
+restoreFromIndexedDBIfNeeded();
 syncSeasonLifecycle();
 reconcileAllTimeChampion();
 
