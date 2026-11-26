@@ -44,6 +44,7 @@ const STORAGE_ACCOUNTS_KEY   = 'roadsense_v4_accounts';
 const STORAGE_ACTIVE_UID_KEY = 'roadsense_v4_active_uid';
 const STORAGE_LAST_OUT_KEY   = 'roadsense_v4_last_logout_uid';
 const STORAGE_SYNC_META_KEY  = 'roadsense_v4_sync_meta';
+const STORAGE_SONGS_META_KEY = 'roadsense_v4_songs_meta';
 const STORAGE_V4_RESET_DONE  = 'roadsense_v4_clean_reset_done';
 const STORAGE_GLOBAL_CFG_KEY = 'roadsense_v4_global_settings';
 const STORAGE_SEASON_KEY     = 'roadsense_v4_season_state';
@@ -63,8 +64,21 @@ const SEASON_ACTIVE_MS = 3 * 24 * 60 * 60 * 1000;
 const SEASON_GAP_MS    = 1 * 24 * 60 * 60 * 1000;
 const SEASON_CYCLE_MS  = SEASON_ACTIVE_MS + SEASON_GAP_MS;
 
+let isBootHydrating = true;
+
+function toArraySafe(val) {
+    if (Array.isArray(val)) return val.filter(Boolean);
+    if (val && typeof val === 'object') return Object.values(val).filter(Boolean);
+    return [];
+}
+function sanitizeDbKey(k) {
+    return String(k || '').replace(/[.#$\[\]\/]/g, '_');
+}
 function lsGet(k, fb = null) { try { const v = localStorage.getItem(k); return v === null ? fb : v; } catch (e) { return fb; } }
-function lsSet(k, v) { try { localStorage.setItem(k, v); idbMirrorSet(k, v); return true; } catch (e) { idbMirrorSet(k, v); return false; } }
+function lsSet(k, v) {
+    try { localStorage.setItem(k, v); if (!isBootHydrating) idbMirrorSet(k, v); return true; }
+    catch (e) { if (!isBootHydrating) idbMirrorSet(k, v); return false; }
+}
 function lsRemove(k) { try { localStorage.removeItem(k); idbMirrorDelete(k); } catch (e) {} }
 function lsGetJson(k, fb) { try { const r = localStorage.getItem(k); if (!r) return fb; const p = JSON.parse(r); return p == null ? fb : p; } catch (e) { return fb; } }
 
@@ -112,22 +126,46 @@ async function restoreFromIndexedDBIfNeeded() {
         allKv.forEach(item => {
             if (!item || !item.key || !item.val) return;
             const cur = lsGet(item.key, null);
-            if (!cur || (item.key === STORAGE_ACCOUNTS_KEY && cur === '{}')) {
+            const isPlaceholderAccs = item.key === STORAGE_ACCOUNTS_KEY && (!cur || cur === '{}' || (Object.keys(accountsCache).length <= 1 && accountsCache[CANONICAL_DEV_UID] && accountsCache[CANONICAL_DEV_UID].editVer === 0));
+            if (!cur || isPlaceholderAccs) {
                 try { localStorage.setItem(item.key, item.val); restored = true; } catch (e) {}
             }
         });
         if (restored) {
+            const freshMeta = lsGetJson(STORAGE_SYNC_META_KEY, null);
+            if (freshMeta && typeof freshMeta === 'object') Object.assign(syncMeta, freshMeta);
+            ensureSyncMetaVersions();
+            const freshSongs = lsGetJson(STORAGE_SONGS_META_KEY, null);
+            if (freshSongs && typeof freshSongs === 'object') songsMetaCache = freshSongs;
+            const freshSeason = lsGetJson(STORAGE_SEASON_KEY, null);
+            if (freshSeason && typeof freshSeason === 'object' && Number(freshSeason.seasonVer) > Number(seasonStateCache.seasonVer || 0)) {
+                seasonStateCache = freshSeason;
+            }
+            const freshAll = lsGetJson(STORAGE_LB_ALL_KEY, null);
+            if (Array.isArray(freshAll) && freshAll.length) lbAllCache = freshAll;
+            const freshSea = lsGetJson(STORAGE_LB_SEASON_KEY, null);
+            if (freshSea && typeof freshSea === 'object') lbSeasonCache = freshSea;
             const accs = lsGetJson(STORAGE_ACCOUNTS_KEY, null);
             if (accs && typeof accs === 'object') {
                 Object.entries(accs).forEach(([u, a]) => {
                     const norm = normalizeAccountRecord(a, u);
-                    if (norm && !accountsCache[u]) accountsCache[u] = norm;
+                    if (norm && (!accountsCache[u] || (accountsCache[u].editVer === 0 && norm.editVer > 0))) {
+                        accountsCache[u] = norm;
+                    }
                 });
-                validateAndSanitizeDatabase();
-                refreshAllLiveViews();
             }
+            validateAndSanitizeDatabase();
+            const restoredUid = lsGet(STORAGE_ACTIVE_UID_KEY, '');
+            if (!activeAccount && restoredUid && accountsCache[restoredUid]) {
+                activateAccountSession(restoredUid);
+            }
+            refreshAllLiveViews();
         }
-    } catch (e) {}
+    } catch (e) {
+    } finally {
+        isBootHydrating = false;
+        applySongsSyncVersions();
+    }
 }
 
 (function purgeLegacyV3DataOnce() {
@@ -431,7 +469,7 @@ let biomeIdx = 0;
 const DEFAULT_VEHICLE_CUST = {
     bodyPrimary: '#475569', bodySecondary: '#38bdf8', canopyColor: '#7dd3fc',
     empColor: '#38bdf8', boostColor: '#fbbf24', nitroSkin: 'standard'
-}
+};
 const GARAGE_PRESETS = {
     steel:    { bodyPrimary: '#1e293b', bodySecondary: '#38bdf8', canopyColor: '#7dd3fc', empColor: '#38bdf8', boostColor: '#fbbf24' },
     cobalt:   { bodyPrimary: '#0f2544', bodySecondary: '#38bdf8', canopyColor: '#bae6fd', empColor: '#00f5d4', boostColor: '#38bdf8' },
@@ -456,8 +494,20 @@ let accountsCache = (() => {
     return (p && typeof p === 'object' && !Array.isArray(p)) ? p : {};
 })();
 
+let songsMetaCache = (() => {
+    const p = lsGetJson(STORAGE_SONGS_META_KEY, {});
+    return (p && typeof p === 'object' && !Array.isArray(p)) ? p : {};
+})();
+function saveSongsMetaCache() { lsSet(STORAGE_SONGS_META_KEY, JSON.stringify(songsMetaCache)); }
+
 let syncMeta = (() => {
-    const def = { wipeAllAccountsTs: 0, wipeAllScoresTs: 0, wipeAllAccountsVer: 0, wipeAllScoresVer: 0, deletedUids: {}, resetScoreTs: {}, resetScoreVer: {}, broadcastMails: [] };
+    const def = {
+        wipeAllAccountsTs: 0, wipeAllScoresTs: 0,
+        wipeAllAccountsVer: 0, wipeAllScoresVer: 0,
+        wipeAllMailVer: 0, wipeAllSongsVer: 0,
+        deletedUids: {}, resetScoreTs: {}, resetScoreVer: {}, deletedSongVer: {},
+        broadcastMails: []
+    };
     const r = lsGetJson(STORAGE_SYNC_META_KEY, null);
     if (!r || typeof r !== 'object') return def;
     return {
@@ -465,31 +515,119 @@ let syncMeta = (() => {
         wipeAllScoresTs: Number(r.wipeAllScoresTs) || 0,
         wipeAllAccountsVer: Number(r.wipeAllAccountsVer) || 0,
         wipeAllScoresVer: Number(r.wipeAllScoresVer) || 0,
+        wipeAllMailVer: Number(r.wipeAllMailVer) || 0,
+        wipeAllSongsVer: Number(r.wipeAllSongsVer) || 0,
         deletedUids: (r.deletedUids && typeof r.deletedUids === 'object') ? r.deletedUids : {},
         resetScoreTs: (r.resetScoreTs && typeof r.resetScoreTs === 'object') ? r.resetScoreTs : {},
         resetScoreVer: (r.resetScoreVer && typeof r.resetScoreVer === 'object') ? r.resetScoreVer : {},
-        broadcastMails: Array.isArray(r.broadcastMails) ? r.broadcastMails : []
+        deletedSongVer: (r.deletedSongVer && typeof r.deletedSongVer === 'object') ? r.deletedSongVer : {},
+        broadcastMails: toArraySafe(r.broadcastMails)
     };
 })();
 function saveSyncMeta() { lsSet(STORAGE_SYNC_META_KEY, JSON.stringify(syncMeta)); }
 function saveAccountsCache() { lsSet(STORAGE_ACCOUNTS_KEY, JSON.stringify(accountsCache)); }
 
+function ensureSyncMetaVersions() {
+    if (typeof syncMeta.wipeAllAccountsVer !== 'number') syncMeta.wipeAllAccountsVer = 0;
+    if (typeof syncMeta.wipeAllScoresVer !== 'number') syncMeta.wipeAllScoresVer = 0;
+    if (typeof syncMeta.wipeAllMailVer !== 'number') syncMeta.wipeAllMailVer = 0;
+    if (typeof syncMeta.wipeAllSongsVer !== 'number') syncMeta.wipeAllSongsVer = 0;
+    if (!syncMeta.resetScoreVer || typeof syncMeta.resetScoreVer !== 'object') syncMeta.resetScoreVer = {};
+    if (!syncMeta.deletedUids || typeof syncMeta.deletedUids !== 'object') syncMeta.deletedUids = {};
+    if (!syncMeta.deletedSongVer || typeof syncMeta.deletedSongVer !== 'object') syncMeta.deletedSongVer = {};
+    delete syncMeta.deletedUids[CANONICAL_DEV_UID];
+    syncMeta.broadcastMails = toArraySafe(syncMeta.broadcastMails);
+}
+ensureSyncMetaVersions();
+
+let seasonStateCache = (() => {
+    const s = lsGetJson(STORAGE_SEASON_KEY, null);
+    if (s && typeof s === 'object' && s.originTs) {
+        return {
+            originTs: Number(s.originTs) || CANONICAL_SEASON_ORIGIN,
+            devOffsetMs: Number(s.devOffsetMs) || 0,
+            seasonVer: Number(s.seasonVer) || 1,
+            seasonResetVer: Number(s.seasonResetVer) || 0,
+            lastAnnouncedSeason: Number(s.lastAnnouncedSeason) || 1,
+            lastFinalizedSeason: Number(s.lastFinalizedSeason) || 0
+        };
+    }
+    const el = Math.max(0, Date.now() - CANONICAL_SEASON_ORIGIN);
+    const sNum = Math.floor(el / SEASON_CYCLE_MS) + 1;
+    const isGap = (el % SEASON_CYCLE_MS) >= SEASON_ACTIVE_MS;
+    return {
+        originTs: CANONICAL_SEASON_ORIGIN,
+        devOffsetMs: 0,
+        seasonVer: 0, // Local placeholder until cloud sync confirms authoritative state
+        seasonResetVer: 0,
+        lastAnnouncedSeason: sNum,
+        lastFinalizedSeason: isGap ? sNum : Math.max(0, sNum - 1)
+    };
+})();
+function saveSeasonState() { lsSet(STORAGE_SEASON_KEY, JSON.stringify(seasonStateCache)); }
+
+function trimIdMap(obj, maxKeys = 160) {
+    if (!obj || typeof obj !== 'object') return {};
+    const keys = Object.keys(obj).filter(k => obj[k]);
+    const sliced = keys.length > maxKeys ? keys.slice(keys.length - maxKeys) : keys;
+    const out = {};
+    sliced.forEach(k => { out[sanitizeDbKey(k)] = true; });
+    return out;
+}
+
 function normalizeAccountRecord(acc, uidKey) {
     if (!acc || typeof acc !== 'object') return null;
     const uid = /^\d{17}$/.test(String(acc.uid || uidKey)) ? String(acc.uid || uidKey) : null;
     if (!uid) return null;
+    const isDev = uid === CANONICAL_DEV_UID;
     const st = (acc.stats && typeof acc.stats === 'object') ? acc.stats : {};
     const cust = (acc.custom && typeof acc.custom === 'object') ? acc.custom : {};
+    const createdAt = isDev ? CANONICAL_SEASON_ORIGIN : (Number(acc.createdAt) || Date.now());
+    const joinedSeason = isDev ? 1 : Math.max(1, Number(acc.joinedSeason) || 1);
+    const readMailIds = (acc.readMailIds && typeof acc.readMailIds === 'object' && !Array.isArray(acc.readMailIds)) ? { ...acc.readMailIds } : {};
+    const deletedMailIds = (acc.deletedMailIds && typeof acc.deletedMailIds === 'object' && !Array.isArray(acc.deletedMailIds)) ? { ...acc.deletedMailIds } : {};
+
+    const inbox = [];
+    const seen = new Set();
+    toArraySafe(acc.inbox).forEach(m => {
+        if (!m || !m.id) return;
+        const mid = sanitizeDbKey(m.id);
+        if (seen.has(mid) || deletedMailIds[mid]) return;
+        const kind = m.kind || (mid.startsWith('bc_') ? 'broadcast' : (mid.startsWith('season_') ? 'season' : (mid.startsWith('hof_') ? 'hof' : 'system')));
+        const ts = Number(m.ts) || Date.now();
+        const sNum = Number(m.seasonNum) || 0;
+        if (kind === 'broadcast' && ts < createdAt) return;
+        if (kind === 'season' && sNum > 0 && sNum < joinedSeason) return;
+        seen.add(mid);
+        const isRead = Boolean(m.read || readMailIds[mid]);
+        if (isRead) readMailIds[mid] = true;
+        inbox.push({
+            id: mid,
+            kind,
+            seasonNum: sNum,
+            title: String(m.title || 'Notice'),
+            sender: String(m.sender || 'SYSTEM'),
+            body: String(m.body || ''),
+            ts,
+            read: isRead,
+            reward: m.reward ? { ...m.reward } : null
+        });
+    });
+    inbox.sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0));
+
     return {
         uid,
-        name: String(acc.name || 'Pilot').trim().slice(0, 28) || 'Pilot',
-        tag: String(acc.tag || '0000').trim().slice(0, 10) || '0000',
-        isDev: uid === CANONICAL_DEV_UID,
-        createdAt: Number(acc.createdAt) || Date.now(),
-        updatedAt: Number(acc.updatedAt) || Number(acc.createdAt) || Date.now(),
+        name: String(acc.name || (isDev ? DEFAULT_DEV_NAME : 'Pilot')).trim().slice(0, 28) || (isDev ? DEFAULT_DEV_NAME : 'Pilot'),
+        tag: String(acc.tag || (isDev ? DEFAULT_DEV_TAG : '0000')).trim().slice(0, 10) || '0000',
+        isDev,
+        createdAt,
+        joinedSeason,
+        updatedAt: Number(acc.updatedAt) || createdAt,
         accVer: typeof acc.accVer === 'number' ? acc.accVer : (syncMeta.wipeAllAccountsVer || 0),
         scoreVer: typeof acc.scoreVer === 'number' ? acc.scoreVer : (syncMeta.wipeAllScoresVer || 0),
         indivScoreVer: typeof acc.indivScoreVer === 'number' ? acc.indivScoreVer : ((syncMeta.resetScoreVer && syncMeta.resetScoreVer[uid]) || 0),
+        mailVer: typeof acc.mailVer === 'number' ? acc.mailVer : (syncMeta.wipeAllMailVer || 0),
+        seasonResetVer: typeof acc.seasonResetVer === 'number' ? acc.seasonResetVer : (Number(seasonStateCache.seasonResetVer) || 0),
         editVer: typeof acc.editVer === 'number' ? acc.editVer : 1,
         stats: {
             allTimeBest: Math.max(0, Number(st.allTimeBest) || 0),
@@ -497,11 +635,13 @@ function normalizeAccountRecord(acc, uidKey) {
             totalFlashes: Math.max(0, Number(st.totalFlashes) || 0),
             totalRuns: Math.max(0, Number(st.totalRuns) || 0),
             completedEpoch250: Boolean(st.completedEpoch250),
-            seasonScores: (st.seasonScores && typeof st.seasonScores === 'object') ? st.seasonScores : {}
+            seasonScores: (st.seasonScores && typeof st.seasonScores === 'object') ? { ...st.seasonScores } : {}
         },
         custom: { ...DEFAULT_VEHICLE_CUST, ...cust },
-        seasonalSkins: Array.isArray(acc.seasonalSkins) ? acc.seasonalSkins : [],
-        inbox: Array.isArray(acc.inbox) ? acc.inbox : []
+        seasonalSkins: toArraySafe(acc.seasonalSkins),
+        inbox: inbox.slice(0, 40),
+        readMailIds,
+        deletedMailIds
     };
 }
 
@@ -520,39 +660,80 @@ function generateUnique17DigitUid() {
     return String(Date.now()).padEnd(17, '9').slice(0, 17);
 }
 
-function makeAccountObj({ uid, name, tag, isDev = false }) {
+function makeAccountObj({ uid, name, tag, isDev = false, joinedSeason = 1, editVer = 1 }) {
+    const devFlag = uid === CANONICAL_DEV_UID || Boolean(isDev);
     const now = Date.now();
     return {
-        uid, name: name.trim(), tag: tag.trim(), isDev: uid === CANONICAL_DEV_UID,
-        createdAt: now, updatedAt: now,
+        uid,
+        name: name.trim(),
+        tag: tag.trim(),
+        isDev: devFlag,
+        createdAt: devFlag ? CANONICAL_SEASON_ORIGIN : now,
+        joinedSeason: devFlag ? 1 : Math.max(1, Number(joinedSeason) || 1),
+        updatedAt: now,
         accVer: syncMeta.wipeAllAccountsVer || 0,
         scoreVer: syncMeta.wipeAllScoresVer || 0,
         indivScoreVer: (syncMeta.resetScoreVer && syncMeta.resetScoreVer[uid]) || 0,
-        editVer: 1,
+        mailVer: syncMeta.wipeAllMailVer || 0,
+        seasonResetVer: Number(seasonStateCache.seasonResetVer) || 0,
+        editVer,
         stats: { allTimeBest: 0, bestEpoch: 1, totalFlashes: 0, totalRuns: 0, completedEpoch250: false, seasonScores: {} },
-        custom: isDev
+        custom: devFlag
             ? { bodyPrimary: '#1a2236', bodySecondary: '#00f5d4', canopyColor: '#c77dff', empColor: '#00f5d4', boostColor: '#ff007f', nitroSkin: 'void_chroma' }
             : { ...DEFAULT_VEHICLE_CUST },
-        seasonalSkins: [], inbox: []
+        seasonalSkins: [],
+        inbox: [],
+        readMailIds: {},
+        deletedMailIds: {}
     };
 }
 
 function packAccountForSync(acc) {
     return {
-        uid: acc.uid, name: acc.name, tag: acc.tag, isDev: acc.isDev,
-        createdAt: acc.createdAt, updatedAt: acc.updatedAt || Date.now(),
+        uid: acc.uid,
+        name: acc.name,
+        tag: acc.tag,
+        isDev: acc.uid === CANONICAL_DEV_UID,
+        createdAt: acc.createdAt,
+        joinedSeason: Math.max(1, Number(acc.joinedSeason) || 1),
+        updatedAt: acc.updatedAt || Date.now(),
         accVer: typeof acc.accVer === 'number' ? acc.accVer : syncMeta.wipeAllAccountsVer,
         scoreVer: typeof acc.scoreVer === 'number' ? acc.scoreVer : syncMeta.wipeAllScoresVer,
         indivScoreVer: typeof acc.indivScoreVer === 'number' ? acc.indivScoreVer : (syncMeta.resetScoreVer[acc.uid] || 0),
-        editVer: typeof acc.editVer === 'number' ? acc.editVer : 1,
-        stats: acc.stats, custom: acc.custom,
-        seasonalSkins: (acc.seasonalSkins || []).slice(-10),
-        inbox: (acc.inbox || []).slice(0, 25)
+        mailVer: typeof acc.mailVer === 'number' ? acc.mailVer : syncMeta.wipeAllMailVer,
+        seasonResetVer: typeof acc.seasonResetVer === 'number' ? acc.seasonResetVer : (Number(seasonStateCache.seasonResetVer) || 0),
+        editVer: Math.max(1, typeof acc.editVer === 'number' ? acc.editVer : 1),
+        stats: acc.stats,
+        custom: acc.custom,
+        seasonalSkins: toArraySafe(acc.seasonalSkins).slice(-10),
+        inbox: toArraySafe(acc.inbox).slice(0, 40),
+        readMailIds: trimIdMap(acc.readMailIds, 160),
+        deletedMailIds: trimIdMap(acc.deletedMailIds, 160)
     };
 }
 
 let activeAccount = null;
 let lastLoggedOutUid = lsGet(STORAGE_LAST_OUT_KEY, '') || '';
+
+function ensureCanonicalDevAccount() {
+    delete syncMeta.deletedUids[CANONICAL_DEV_UID];
+    if (!accountsCache[CANONICAL_DEV_UID]) {
+        // editVer: 0 marks local placeholder so Firebase Dev record cleanly replaces it on any device
+        accountsCache[CANONICAL_DEV_UID] = makeAccountObj({
+            uid: CANONICAL_DEV_UID,
+            name: DEFAULT_DEV_NAME,
+            tag: DEFAULT_DEV_TAG,
+            isDev: true,
+            joinedSeason: 1,
+            editVer: 0
+        });
+    } else {
+        accountsCache[CANONICAL_DEV_UID].isDev = true;
+        accountsCache[CANONICAL_DEV_UID].createdAt = CANONICAL_SEASON_ORIGIN;
+        accountsCache[CANONICAL_DEV_UID].joinedSeason = 1;
+    }
+    return accountsCache[CANONICAL_DEV_UID];
+}
 
 function validateAndSanitizeDatabase() {
     const clean = {};
@@ -561,36 +742,11 @@ function validateAndSanitizeDatabase() {
         if (norm) clean[norm.uid] = norm;
     });
     accountsCache = clean;
-    if (!accountsCache[CANONICAL_DEV_UID]) {
-        accountsCache[CANONICAL_DEV_UID] = makeAccountObj({ uid: CANONICAL_DEV_UID, name: DEFAULT_DEV_NAME, tag: DEFAULT_DEV_TAG, isDev: true });
-        pushMail(accountsCache[CANONICAL_DEV_UID], {
-            id: 'dev_welcome_root',
-            title: 'Dev Root Ready (IndexedDB + Firebase 24/7)',
-            sender: 'SYSTEM',
-            body: 'Your unique 17-digit Dev UID is synced across all browsers.\nNames & IDs are completely unrestricted for all players.'
-        });
-    }
+    ensureCanonicalDevAccount();
     Object.values(accountsCache).forEach(acc => { acc.isDev = (acc.uid === CANONICAL_DEV_UID); });
     if (lastLoggedOutUid && !accountsCache[lastLoggedOutUid]) { lastLoggedOutUid = ''; lsRemove(STORAGE_LAST_OUT_KEY); }
     saveAccountsCache();
 }
-
-let seasonStateCache = (() => {
-    const s = lsGetJson(STORAGE_SEASON_KEY, null);
-    if (s && typeof s === 'object' && s.originTs) {
-        return {
-            originTs: Number(s.originTs) || CANONICAL_SEASON_ORIGIN,
-            devOffsetMs: Number(s.devOffsetMs) || 0,
-            seasonVer: Number(s.seasonVer) || 1,
-            lastAnnouncedSeason: Number(s.lastAnnouncedSeason) || 0,
-            lastFinalizedSeason: Number(s.lastFinalizedSeason) || 0
-        };
-    }
-    const fresh = { originTs: CANONICAL_SEASON_ORIGIN, devOffsetMs: 0, seasonVer: 1, lastAnnouncedSeason: 0, lastFinalizedSeason: 0 };
-    lsSet(STORAGE_SEASON_KEY, JSON.stringify(fresh));
-    return fresh;
-})();
-function saveSeasonState() { lsSet(STORAGE_SEASON_KEY, JSON.stringify(seasonStateCache)); }
 
 let lbAllCache = (() => {
     const a = lsGetJson(STORAGE_LB_ALL_KEY, []);
@@ -623,20 +779,11 @@ function computeSeasonStatus() {
 // 7. QUOTA-SAFE FIREBASE 24/7 + INDEXEDDB + LOCAL BROADCAST SYNC ENGINE
 // =========================================================================
 let localBc = null;
-try { if ('BroadcastChannel' in window) localBc = new BroadcastChannel('roadsense_v4_rt_v12'); } catch (e) { localBc = null; }
+try { if ('BroadcastChannel' in window) localBc = new BroadcastChannel('roadsense_v4_rt_v13'); } catch (e) { localBc = null; }
 
 let rtEventSource = null, rtReconnectTimer = null, rtPollTimer = null;
 let isPullingCloud = false, lastSeenPulsePid = '';
 const seenPacketIds = new Set();
-
-function ensureSyncMetaVersions() {
-    if (typeof syncMeta.wipeAllAccountsVer !== 'number') syncMeta.wipeAllAccountsVer = 0;
-    if (typeof syncMeta.wipeAllScoresVer !== 'number') syncMeta.wipeAllScoresVer = 0;
-    if (!syncMeta.resetScoreVer || typeof syncMeta.resetScoreVer !== 'object') syncMeta.resetScoreVer = {};
-    if (!syncMeta.deletedUids || typeof syncMeta.deletedUids !== 'object') syncMeta.deletedUids = {};
-    if (!Array.isArray(syncMeta.broadcastMails)) syncMeta.broadcastMails = [];
-}
-ensureSyncMetaVersions();
 
 function setRealtimeStatusUI(state) {
     const text = state === 'live' ? '🟢 LIVE DB' : (state === 'syncing' ? '🟡 SYNC' : '🔵 LOCAL IDB');
@@ -648,9 +795,9 @@ function setRealtimeStatusUI(state) {
 }
 
 function refreshAllLiveViews() {
-    syncSeasonLifecycle();
+    syncSeasonLifecycle(false);
     refreshSeasonUI();
-    reconcileAllTimeChampion();
+    reconcileAllTimeChampion(false);
     updateTopLeaderBanner();
     refreshMenuAccountUI();
     refreshInboxBadgeUI();
@@ -658,7 +805,7 @@ function refreshAllLiveViews() {
     if (document.getElementById('leaderboardModal').style.display === 'flex') renderLeaderboardList();
     if (document.getElementById('inboxModal').style.display === 'flex') renderInboxList();
     if (document.getElementById('pauseSettingsModal').style.display === 'flex') {
-        if (currentSettingsTab === 'dev') renderDevAccountsList();
+        if (currentSettingsTab === 'dev') { renderDevAccountsList(); renderDevCustomSongsList(); }
         if (currentSettingsTab === 'garage') buildGarageUI();
     }
 }
@@ -687,28 +834,103 @@ function getSharedSeasonPayload() {
     return {
         originTs: Number(seasonStateCache.originTs) || CANONICAL_SEASON_ORIGIN,
         devOffsetMs: Number(seasonStateCache.devOffsetMs) || 0,
-        seasonVer: Number(seasonStateCache.seasonVer) || 1
+        seasonVer: Math.max(1, Number(seasonStateCache.seasonVer) || 1),
+        seasonResetVer: Number(seasonStateCache.seasonResetVer) || 0,
+        lastAnnouncedSeason: Number(seasonStateCache.lastAnnouncedSeason) || 1,
+        lastFinalizedSeason: Number(seasonStateCache.lastFinalizedSeason) || 0
     };
+}
+
+function applySeasonResetLocally(newSeasonState) {
+    if (newSeasonState && typeof newSeasonState === 'object') {
+        seasonStateCache.originTs = Number(newSeasonState.originTs) || Date.now();
+        seasonStateCache.devOffsetMs = Number(newSeasonState.devOffsetMs) || 0;
+        seasonStateCache.seasonVer = Math.max(Number(newSeasonState.seasonVer) || 1, (Number(seasonStateCache.seasonVer) || 0) + 1);
+        seasonStateCache.seasonResetVer = Math.max(Number(newSeasonState.seasonResetVer) || 1, Number(seasonStateCache.seasonResetVer) || 0);
+        seasonStateCache.lastFinalizedSeason = 0;
+        seasonStateCache.lastAnnouncedSeason = 1;
+        saveSeasonState();
+    }
+    lbSeasonCache = {};
+    saveLbSeason();
+    const resetVer = Number(seasonStateCache.seasonResetVer) || 0;
+    const feat1 = getSeasonFeaturedSkin(1);
+    const s1MailId = `season_1_started_v${resetVer}`;
+    Object.values(accountsCache).forEach(acc => {
+        acc.joinedSeason = 1;
+        acc.seasonResetVer = resetVer;
+        acc.stats.seasonScores = {};
+        acc.seasonalSkins = [];
+        if (!acc.isDev && acc.custom.nitroSkin !== 'standard' && acc.custom.nitroSkin !== 'void_chroma') {
+            acc.custom.nitroSkin = 'standard';
+        }
+        acc.inbox = toArraySafe(acc.inbox).filter(m => m && m.kind !== 'season' && !String(m.id || '').startsWith('season_'));
+        if (acc.readMailIds) Object.keys(acc.readMailIds).forEach(k => { if (k.startsWith('season_')) delete acc.readMailIds[k]; });
+        if (acc.deletedMailIds) Object.keys(acc.deletedMailIds).forEach(k => { if (k.startsWith('season_')) delete acc.deletedMailIds[k]; });
+        pushMail(acc, {
+            id: s1MailId,
+            kind: 'season',
+            seasonNum: 1,
+            title: 'Season 1 Live',
+            sender: 'SEASON ENGINE',
+            body: `STATUS: Season 1 Active (3d)\nTOP 5 REWARD: ${feat1.name} (valid for S2)\nALL-TIME #1: Void Prismatic FX (All-in-One Chroma)\nNEXT PHASE: 24h Off-Season Gap after Season 1`
+        });
+        acc.editVer = (Number(acc.editVer) || 0) + 1;
+    });
+    saveAccountsCache();
+    seasonStatusCache = computeSeasonStatus();
+}
+
+function applyResetAllMessagesLocally() {
+    syncMeta.broadcastMails = [];
+    saveSyncMeta();
+    Object.values(accountsCache).forEach(acc => {
+        acc.inbox = [];
+        acc.readMailIds = {};
+        acc.deletedMailIds = {};
+        acc.mailVer = syncMeta.wipeAllMailVer;
+        acc.editVer = (Number(acc.editVer) || 0) + 1;
+    });
+    saveAccountsCache();
 }
 
 function applyRemoteSeasonState(remSeason, notifyToast = false) {
     if (!remSeason || typeof remSeason !== 'object') return false;
     const remVer = Number(remSeason.seasonVer) || 1;
-    const curVer = Number(seasonStateCache.seasonVer) || 1;
+    const curVer = Number(seasonStateCache.seasonVer) || 0;
+    const remResetVer = Number(remSeason.seasonResetVer) || 0;
+    const curResetVer = Number(seasonStateCache.seasonResetVer) || 0;
     const remOff = Number(remSeason.devOffsetMs) || 0;
     const curOff = Number(seasonStateCache.devOffsetMs) || 0;
     const remOrig = Number(remSeason.originTs) || CANONICAL_SEASON_ORIGIN;
 
-    if (remVer > curVer || remOff !== curOff || remOrig !== seasonStateCache.originTs) {
+    if (remResetVer > curResetVer) {
+        applySeasonResetLocally(remSeason);
+        refreshSeasonUI();
+        if (notifyToast) showToast('↺ Seasons reset to Season 1 (Active)', 'ok');
+        return true;
+    }
+
+    const shouldAdopt = (curVer === 0) || (remVer > curVer) || (remVer === curVer && (remOff !== curOff || remOrig !== seasonStateCache.originTs || Number(remSeason.lastFinalizedSeason || 0) > Number(seasonStateCache.lastFinalizedSeason || 0) || Number(remSeason.lastAnnouncedSeason || 0) > Number(seasonStateCache.lastAnnouncedSeason || 0)));
+    if (shouldAdopt) {
         seasonStateCache.originTs = remOrig;
         seasonStateCache.devOffsetMs = remOff;
-        seasonStateCache.seasonVer = Math.max(remVer, curVer);
+        seasonStateCache.seasonVer = Math.max(remVer, curVer, 1);
+        seasonStateCache.seasonResetVer = Math.max(remResetVer, curResetVer);
+        if (typeof remSeason.lastFinalizedSeason === 'number') seasonStateCache.lastFinalizedSeason = remSeason.lastFinalizedSeason;
+        if (typeof remSeason.lastAnnouncedSeason === 'number') seasonStateCache.lastAnnouncedSeason = remSeason.lastAnnouncedSeason;
         saveSeasonState();
-        syncSeasonLifecycle();
+        seasonStatusCache = computeSeasonStatus();
+        // Clamp joinedSeason if Dev wound season backward
+        Object.values(accountsCache).forEach(acc => {
+            if ((Number(acc.joinedSeason) || 1) > seasonStatusCache.seasonNum) {
+                acc.joinedSeason = seasonStatusCache.seasonNum;
+            }
+        });
+        saveAccountsCache();
+        syncSeasonLifecycle(false);
         refreshSeasonUI();
-        if (notifyToast) {
-            showToast(`⏩ Season ${seasonStatusCache.seasonNum} (${seasonStatusCache.phase}) Live`, 'ok');
-        }
+        if (notifyToast) showToast(`Season ${seasonStatusCache.seasonNum} (${seasonStatusCache.phase}) Live`, 'ok');
         return true;
     }
     return false;
@@ -729,6 +951,17 @@ async function publishRealtimeEvent(op, data = {}) {
         syncMeta.wipeAllAccountsVer += 1;
         syncMeta.deletedUids = {};
         saveSyncMeta();
+    } else if (op === 'mail_reset_all') {
+        syncMeta.wipeAllMailVer += 1;
+        applyResetAllMessagesLocally();
+        saveSyncMeta();
+    } else if (op === 'songs_reset_all') {
+        syncMeta.wipeAllSongsVer += 1;
+        syncMeta.deletedSongVer = {};
+        saveSyncMeta();
+    } else if (op === 'song_delete' && data.uid) {
+        syncMeta.deletedSongVer[data.uid] = (Number(syncMeta.deletedSongVer[data.uid]) || 0) + 1;
+        saveSyncMeta();
     } else if (op === 'score_reset' && data.uid) {
         syncMeta.resetScoreVer[data.uid] = (Number(syncMeta.resetScoreVer[data.uid]) || 0) + 1;
         if (accountsCache[data.uid]) {
@@ -746,7 +979,9 @@ async function publishRealtimeEvent(op, data = {}) {
             accountsCache[u].accVer = syncMeta.wipeAllAccountsVer;
             accountsCache[u].scoreVer = syncMeta.wipeAllScoresVer;
             accountsCache[u].indivScoreVer = syncMeta.resetScoreVer[u] || 0;
-            accountsCache[u].editVer = (Number(accountsCache[u].editVer) || 0) + 1;
+            accountsCache[u].mailVer = syncMeta.wipeAllMailVer;
+            accountsCache[u].seasonResetVer = Number(seasonStateCache.seasonResetVer) || 0;
+            accountsCache[u].editVer = Math.max(1, (Number(accountsCache[u].editVer) || 0) + 1);
             saveAccountsCache();
         }
     } else if (op === 'score_record' && data.entry && data.entry.uid) {
@@ -755,25 +990,30 @@ async function publishRealtimeEvent(op, data = {}) {
             accountsCache[u].accVer = syncMeta.wipeAllAccountsVer;
             accountsCache[u].scoreVer = syncMeta.wipeAllScoresVer;
             accountsCache[u].indivScoreVer = syncMeta.resetScoreVer[u] || 0;
-            accountsCache[u].editVer = (Number(accountsCache[u].editVer) || 0) + 1;
+            accountsCache[u].mailVer = syncMeta.wipeAllMailVer;
+            accountsCache[u].seasonResetVer = Number(seasonStateCache.seasonResetVer) || 0;
+            accountsCache[u].editVer = Math.max(1, (Number(accountsCache[u].editVer) || 0) + 1);
             saveAccountsCache();
         }
     } else if (op === 'mail_broadcast' && data.mail) {
         if (!syncMeta.broadcastMails.some(m => m.id === data.mail.id)) {
             syncMeta.broadcastMails.unshift(data.mail);
-            if (syncMeta.broadcastMails.length > 15) syncMeta.broadcastMails.length = 15;
+            if (syncMeta.broadcastMails.length > 25) syncMeta.broadcastMails.length = 25;
             saveSyncMeta();
         }
     }
 
     const sharedSeason = getSharedSeasonPayload();
     const localPacket = {
-        type: 'rs_sync_v12', pid, sender: CLIENT_ID, op,
+        type: 'rs_sync_v13', pid, sender: CLIENT_ID, op,
         meta: {
             wipeAllAccountsVer: syncMeta.wipeAllAccountsVer,
             wipeAllScoresVer: syncMeta.wipeAllScoresVer,
+            wipeAllMailVer: syncMeta.wipeAllMailVer,
+            wipeAllSongsVer: syncMeta.wipeAllSongsVer,
             resetScoreVer: syncMeta.resetScoreVer,
             deletedUids: syncMeta.deletedUids,
+            deletedSongVer: syncMeta.deletedSongVer,
             broadcastMails: syncMeta.broadcastMails
         },
         seasonState: sharedSeason,
@@ -803,14 +1043,13 @@ async function publishRealtimeEvent(op, data = {}) {
         } else if (op === 'acc_delete' && data.uid) {
             await fbRequest(`/accounts/${data.uid}`, 'DELETE');
             await fbRequest(`/leaderboards/alltime/${data.uid}`, 'DELETE');
+            await fbRequest(`/songsMeta/${data.uid}`, 'DELETE');
             await fbRequest(`/meta/deletedUids/${data.uid}`, 'PUT', true);
             await fbRequest('/pulse', 'PUT', { pid, op, uid: data.uid, ts: Date.now() });
         } else if (op === 'score_reset' && data.uid) {
             const u = data.uid;
             await fbRequest(`/leaderboards/alltime/${u}`, 'DELETE');
-            Object.keys(lbSeasonCache).forEach(sKey => {
-                fbRequest(`/leaderboards/season/${sKey}/${u}`, 'DELETE');
-            });
+            Object.keys(lbSeasonCache).forEach(sKey => { fbRequest(`/leaderboards/season/${sKey}/${u}`, 'DELETE'); });
             if (accountsCache[u]) await fbRequest(`/accounts/${u}`, 'PUT', packAccountForSync(accountsCache[u]));
             await fbRequest(`/meta/resetScoreVer/${u}`, 'PUT', syncMeta.resetScoreVer[u]);
             await fbRequest('/pulse', 'PUT', { pid, op, uid: u, resetVer: syncMeta.resetScoreVer[u], ts: Date.now() });
@@ -823,16 +1062,46 @@ async function publishRealtimeEvent(op, data = {}) {
             await fbRequest('/pulse', 'PUT', { pid, op, wipeAllScoresVer: syncMeta.wipeAllScoresVer, ts: Date.now() });
         } else if (op === 'acc_delete_all') {
             const devPacked = packAccountForSync(accountsCache[CANONICAL_DEV_UID]);
+            const devSong = songsMetaCache[CANONICAL_DEV_UID] ? { [CANONICAL_DEV_UID]: songsMetaCache[CANONICAL_DEV_UID] } : null;
             await fbRequest('/accounts', 'PUT', { [CANONICAL_DEV_UID]: devPacked });
             await fbRequest('/leaderboards', 'DELETE');
+            if (devSong) await fbRequest('/songsMeta', 'PUT', devSong); else await fbRequest('/songsMeta', 'DELETE');
             await fbRequest('/meta/wipeAllAccountsVer', 'PUT', syncMeta.wipeAllAccountsVer);
             await fbRequest('/meta/deletedUids', 'DELETE');
             await fbRequest('/pulse', 'PUT', { pid, op, wipeAllAccountsVer: syncMeta.wipeAllAccountsVer, ts: Date.now() });
         } else if (op === 'mail_broadcast' && data.mail) {
             await fbRequest('/meta/latestMail', 'PUT', data.mail);
             await fbRequest('/meta/broadcastMails', 'PUT', syncMeta.broadcastMails);
+            if (activeAccount) await fbRequest(`/accounts/${activeAccount.uid}`, 'PUT', packAccountForSync(activeAccount));
             await fbRequest('/pulse', 'PUT', { pid, op, mail: data.mail, ts: Date.now() });
+        } else if (op === 'mail_reset_all') {
+            await fbRequest('/meta/wipeAllMailVer', 'PUT', syncMeta.wipeAllMailVer);
+            await fbRequest('/meta/broadcastMails', 'DELETE');
+            await fbRequest('/meta/latestMail', 'DELETE');
+            const allPacked = {};
+            Object.values(accountsCache).forEach(a => { allPacked[a.uid] = packAccountForSync(a); });
+            await fbRequest('/accounts', 'PUT', allPacked);
+            await fbRequest('/pulse', 'PUT', { pid, op, wipeAllMailVer: syncMeta.wipeAllMailVer, ts: Date.now() });
+        } else if (op === 'song_upsert' && data.songMeta && data.songMeta.uid) {
+            await fbRequest(`/songsMeta/${data.songMeta.uid}`, 'PUT', data.songMeta);
+            await fbRequest('/pulse', 'PUT', { pid, op, songMeta: data.songMeta, ts: Date.now() });
+        } else if (op === 'song_delete' && data.uid) {
+            await fbRequest(`/songsMeta/${data.uid}`, 'DELETE');
+            await fbRequest(`/meta/deletedSongVer/${data.uid}`, 'PUT', syncMeta.deletedSongVer[data.uid]);
+            await fbRequest('/pulse', 'PUT', { pid, op, uid: data.uid, songDelVer: syncMeta.deletedSongVer[data.uid], ts: Date.now() });
+        } else if (op === 'songs_reset_all') {
+            await fbRequest('/songsMeta', 'DELETE');
+            await fbRequest('/meta/deletedSongVer', 'DELETE');
+            await fbRequest('/meta/wipeAllSongsVer', 'PUT', syncMeta.wipeAllSongsVer);
+            await fbRequest('/pulse', 'PUT', { pid, op, wipeAllSongsVer: syncMeta.wipeAllSongsVer, ts: Date.now() });
         } else if (op === 'season_sync') {
+            await fbRequest('/meta/seasonState', 'PUT', sharedSeason);
+            const allPacked = {};
+            Object.values(accountsCache).forEach(a => { allPacked[a.uid] = packAccountForSync(a); });
+            await fbRequest('/accounts', 'PUT', allPacked);
+            await fbRequest('/pulse', 'PUT', { pid, op, seasonState: sharedSeason, ts: Date.now() });
+        } else if (op === 'season_reset') {
+            await fbRequest('/leaderboards/season', 'DELETE');
             await fbRequest('/meta/seasonState', 'PUT', sharedSeason);
             const allPacked = {};
             Object.values(accountsCache).forEach(a => { allPacked[a.uid] = packAccountForSync(a); });
@@ -845,39 +1114,75 @@ async function publishRealtimeEvent(op, data = {}) {
 
 function mergeAccountInboxAndSkins(targetAcc, incomingAcc) {
     if (!targetAcc || !incomingAcc) return;
-    // 1. Merge seasonalSkins (preserve claimed & expired flags across devices)
-    if (Array.isArray(incomingAcc.seasonalSkins)) {
-        if (!Array.isArray(targetAcc.seasonalSkins)) targetAcc.seasonalSkins = [];
-        incomingAcc.seasonalSkins.forEach(incSk => {
-            if (!incSk || !incSk.skinId) return;
-            const ex = targetAcc.seasonalSkins.find(s => s.skinId === incSk.skinId && s.validForSeason === incSk.validForSeason);
-            if (!ex) {
-                targetAcc.seasonalSkins.push({ ...incSk });
-            } else {
-                ex.claimed = Boolean(ex.claimed || incSk.claimed);
-                ex.expired = Boolean(ex.expired || incSk.expired);
-                ex.rank = ex.rank || incSk.rank;
-            }
-        });
+    const curMailVer = Number(targetAcc.mailVer) || 0;
+    const incMailVer = Number(incomingAcc.mailVer) || 0;
+    const effMailVer = Math.max(curMailVer, incMailVer, Number(syncMeta.wipeAllMailVer) || 0);
+
+    if (curMailVer < effMailVer) {
+        targetAcc.inbox = [];
+        targetAcc.readMailIds = {};
+        targetAcc.deletedMailIds = {};
     }
-    // 2. Merge inbox mails by deterministic ID (preserve read & reward.claimed flags)
-    if (Array.isArray(incomingAcc.inbox)) {
-        if (!Array.isArray(targetAcc.inbox)) targetAcc.inbox = [];
-        incomingAcc.inbox.forEach(incM => {
-            if (!incM || !incM.id) return;
-            const exM = targetAcc.inbox.find(m => m.id === incM.id);
-            if (!exM) {
-                targetAcc.inbox.push({ ...incM });
-            } else {
-                exM.read = Boolean(exM.read || incM.read);
-                if (exM.reward && incM.reward) {
-                    exM.reward.claimed = Boolean(exM.reward.claimed || incM.reward.claimed);
-                }
-            }
-        });
-        targetAcc.inbox.sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0));
-        if (targetAcc.inbox.length > 50) targetAcc.inbox.length = 50;
+    if (incMailVer < effMailVer) {
+        incomingAcc.inbox = [];
+        incomingAcc.readMailIds = {};
+        incomingAcc.deletedMailIds = {};
     }
+    targetAcc.mailVer = effMailVer;
+
+    // 1. Merge seasonalSkins
+    const incSkins = toArraySafe(incomingAcc.seasonalSkins);
+    if (!Array.isArray(targetAcc.seasonalSkins)) targetAcc.seasonalSkins = [];
+    incSkins.forEach(incSk => {
+        if (!incSk || !incSk.skinId) return;
+        const ex = targetAcc.seasonalSkins.find(s => s.skinId === incSk.skinId && s.validForSeason === incSk.validForSeason);
+        if (!ex) targetAcc.seasonalSkins.push({ ...incSk });
+        else {
+            ex.claimed = Boolean(ex.claimed || incSk.claimed);
+            ex.expired = Boolean(ex.expired || incSk.expired);
+            ex.rank = ex.rank || incSk.rank;
+        }
+    });
+
+    // 2. Union deletedMailIds tombstones (deleted ALWAYS wins permanently!)
+    if (!targetAcc.deletedMailIds || typeof targetAcc.deletedMailIds !== 'object') targetAcc.deletedMailIds = {};
+    const incDel = (incomingAcc.deletedMailIds && typeof incomingAcc.deletedMailIds === 'object') ? incomingAcc.deletedMailIds : {};
+    Object.keys(incDel).forEach(mid => { if (incDel[mid]) targetAcc.deletedMailIds[sanitizeDbKey(mid)] = true; });
+
+    // 3. Union readMailIds (read ALWAYS stays read across reloads/cache clears/devices!)
+    if (!targetAcc.readMailIds || typeof targetAcc.readMailIds !== 'object') targetAcc.readMailIds = {};
+    const incRead = (incomingAcc.readMailIds && typeof incomingAcc.readMailIds === 'object') ? incomingAcc.readMailIds : {};
+    Object.keys(incRead).forEach(mid => { if (incRead[mid]) targetAcc.readMailIds[sanitizeDbKey(mid)] = true; });
+    toArraySafe(targetAcc.inbox).forEach(m => { if (m && m.id && m.read) targetAcc.readMailIds[sanitizeDbKey(m.id)] = true; });
+    toArraySafe(incomingAcc.inbox).forEach(m => { if (m && m.id && m.read) targetAcc.readMailIds[sanitizeDbKey(m.id)] = true; });
+
+    // 4. Merge non-deleted eligible inbox items
+    const byId = new Map();
+    const consider = m => {
+        if (!m || !m.id) return;
+        const mid = sanitizeDbKey(m.id);
+        if (targetAcc.deletedMailIds[mid]) return;
+        const kind = m.kind || (mid.startsWith('bc_') ? 'broadcast' : (mid.startsWith('season_') ? 'season' : (mid.startsWith('hof_') ? 'hof' : 'system')));
+        const ts = Number(m.ts) || Date.now();
+        const sNum = Number(m.seasonNum) || 0;
+        if (kind === 'broadcast' && ts < (Number(targetAcc.createdAt) || 0)) return;
+        if (kind === 'season' && sNum > 0 && sNum < (Number(targetAcc.joinedSeason) || 1)) return;
+        const ex = byId.get(mid);
+        const isRead = Boolean(m.read || targetAcc.readMailIds[mid]);
+        if (!ex) {
+            byId.set(mid, { ...m, id: mid, kind, seasonNum: sNum, ts, read: isRead, reward: m.reward ? { ...m.reward } : null });
+        } else {
+            ex.read = Boolean(ex.read || isRead);
+            if (ex.reward && m.reward) ex.reward.claimed = Boolean(ex.reward.claimed || m.reward.claimed);
+            else if (!ex.reward && m.reward) ex.reward = { ...m.reward };
+        }
+    };
+    toArraySafe(targetAcc.inbox).forEach(consider);
+    toArraySafe(incomingAcc.inbox).forEach(consider);
+
+    targetAcc.inbox = Array.from(byId.values())
+        .sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0))
+        .slice(0, 40);
 }
 
 function mergeSingleAccountRecord(rawAcc, fromReplay = false) {
@@ -893,6 +1198,23 @@ function mergeSingleAccountRecord(rawAcc, fromReplay = false) {
 
     const inc = normalizeAccountRecord(rawAcc, u);
     if (!inc) return false;
+
+    if ((Number(inc.mailVer) || 0) < syncMeta.wipeAllMailVer) {
+        inc.inbox = [];
+        inc.readMailIds = {};
+        inc.deletedMailIds = {};
+        inc.mailVer = syncMeta.wipeAllMailVer;
+    }
+
+    const curResetVer = Number(seasonStateCache.seasonResetVer) || 0;
+    if ((Number(inc.seasonResetVer) || 0) < curResetVer) {
+        inc.joinedSeason = 1;
+        inc.stats.seasonScores = {};
+        inc.seasonalSkins = [];
+        if (!inc.isDev && inc.custom.nitroSkin !== 'standard' && inc.custom.nitroSkin !== 'void_chroma') inc.custom.nitroSkin = 'standard';
+        inc.inbox = inc.inbox.filter(m => m && m.kind !== 'season' && !String(m.id || '').startsWith('season_'));
+        inc.seasonResetVer = curResetVer;
+    }
 
     const remScoreVer = typeof rawAcc.scoreVer === 'number' ? rawAcc.scoreVer : 0;
     const remIndivVer = typeof rawAcc.indivScoreVer === 'number' ? rawAcc.indivScoreVer : 0;
@@ -910,13 +1232,19 @@ function mergeSingleAccountRecord(rawAcc, fromReplay = false) {
     const remEditVer = Number(rawAcc.editVer) || 1;
     const curEditVer = cur ? (Number(cur.editVer) || 0) : 0;
 
-    if (!cur) {
+    if (!cur || curEditVer === 0) {
+        // Fresh device or uninitialized Dev placeholder: adopt authoritative cloud record cleanly
         inc.accVer = syncMeta.wipeAllAccountsVer;
         inc.scoreVer = syncMeta.wipeAllScoresVer;
         inc.indivScoreVer = curIndivVer;
-        inc.editVer = remEditVer;
+        inc.mailVer = Math.max(Number(inc.mailVer) || 0, syncMeta.wipeAllMailVer);
+        inc.seasonResetVer = Math.max(Number(inc.seasonResetVer) || 0, curResetVer);
+        inc.editVer = Math.max(1, remEditVer);
         accountsCache[u] = inc;
+        if (activeAccount && activeAccount.uid === u) activeAccount = accountsCache[u];
     } else {
+        cur.createdAt = cur.isDev ? CANONICAL_SEASON_ORIGIN : Math.min(cur.createdAt || inc.createdAt, inc.createdAt || cur.createdAt);
+        cur.joinedSeason = cur.isDev ? 1 : Math.min(cur.joinedSeason || 1, inc.joinedSeason || 1);
         if (remEditVer >= curEditVer) {
             cur.name = inc.name;
             cur.tag = inc.tag;
@@ -943,6 +1271,7 @@ function mergeSingleAccountRecord(rawAcc, fromReplay = false) {
         cur.accVer = syncMeta.wipeAllAccountsVer;
         cur.scoreVer = syncMeta.wipeAllScoresVer;
         cur.indivScoreVer = curIndivVer;
+        cur.seasonResetVer = Math.max(Number(cur.seasonResetVer) || 0, curResetVer);
         if (activeAccount && activeAccount.uid === u) activeAccount = cur;
         syncAccountMetaInLeaderboards(cur);
     }
@@ -955,15 +1284,11 @@ function mergeSingleAccountRecord(rawAcc, fromReplay = false) {
             accent: finalAcc.custom.bodySecondary, skinId: finalAcc.custom.nitroSkin,
             isPrism: finalAcc.custom.nitroSkin === 'void_chroma', ts: Date.now()
         };
-        if (finalAcc.stats.allTimeBest > 0) {
-            mergeScoreEntryLocally(baseEntry, 0, 0);
-        }
+        if (finalAcc.stats.allTimeBest > 0) mergeScoreEntryLocally(baseEntry, 0, 0);
         const sMap = finalAcc.stats.seasonScores || {};
         Object.entries(sMap).forEach(([sKey, sPts]) => {
             const sNum = Number(sKey), pts = Number(sPts) || 0;
-            if (sNum > 0 && pts > 0) {
-                mergeScoreEntryLocally(baseEntry, sNum, pts);
-            }
+            if (sNum > 0 && pts > 0) mergeScoreEntryLocally(baseEntry, sNum, pts);
         });
     }
     saveAccountsCache();
@@ -972,36 +1297,52 @@ function mergeSingleAccountRecord(rawAcc, fromReplay = false) {
 
 function deliverBroadcastMailLocally(mailObj, showNotification = false) {
     if (!mailObj || !mailObj.id || !mailObj.title || !mailObj.body) return false;
-    let added = false;
-    if (!syncMeta.broadcastMails.some(m => m.id === mailObj.id)) {
-        syncMeta.broadcastMails.unshift(mailObj);
-        if (syncMeta.broadcastMails.length > 15) syncMeta.broadcastMails.length = 15;
+    const mid = sanitizeDbKey(mailObj.id);
+    const mailTs = Number(mailObj.ts) || Date.now();
+    const normalized = {
+        id: mid,
+        kind: 'broadcast',
+        seasonNum: 0,
+        title: String(mailObj.title),
+        sender: String(mailObj.sender || 'DEV BROADCAST'),
+        body: String(mailObj.body),
+        ts: mailTs,
+        read: false,
+        reward: null
+    };
+
+    if (!syncMeta.broadcastMails.some(m => sanitizeDbKey(m.id) === mid)) {
+        syncMeta.broadcastMails.unshift(normalized);
+        if (syncMeta.broadcastMails.length > 25) syncMeta.broadcastMails.length = 25;
         saveSyncMeta();
     }
+
+    let added = false;
+    let notifiedActive = false;
     Object.values(accountsCache).forEach(acc => {
-        if (!(acc.inbox || []).some(m => m.id === mailObj.id)) {
-            acc.inbox.unshift({ ...mailObj, read: false });
-            if (acc.inbox.length > 50) acc.inbox.length = 50;
-            added = true;
-        }
+        // 1. Never deliver broadcasts older than the account's creation time
+        if ((Number(acc.createdAt) || 0) > mailTs) return;
+        // 2. Phone-style tombstone: once deleted, NEVER re-deliver
+        if (acc.deletedMailIds && acc.deletedMailIds[mid]) return;
+        // 3. Never duplicate
+        if ((acc.inbox || []).some(m => sanitizeDbKey(m.id) === mid)) return;
+        const alreadyRead = Boolean(acc.readMailIds && acc.readMailIds[mid]);
+        acc.inbox.unshift({ ...normalized, read: alreadyRead });
+        if (acc.inbox.length > 40) acc.inbox.length = 40;
+        added = true;
+        if (activeAccount && activeAccount.uid === acc.uid && !alreadyRead) notifiedActive = true;
     });
     if (added) {
         saveAccountsCache();
-        if (showNotification && activeAccount) showToast(`📬 New Mail: ${mailObj.title}`, 'ok');
+        if (showNotification && notifiedActive) showToast(`📢 Broadcast: ${normalized.title}`, 'ok');
     }
     return added;
 }
 
-function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
-    if (!pkt || typeof pkt !== 'object') return;
-    if (pkt.pid) {
-        if (seenPacketIds.has(pkt.pid)) return;
-        seenPacketIds.add(pkt.pid);
-    }
-
+function applyRemoteMetaEnvelope(remMeta, fromReplay = false) {
+    if (!remMeta || typeof remMeta !== 'object') return false;
     ensureSyncMetaVersions();
     let changed = false;
-    const remMeta = pkt.meta || {};
 
     if (Number(remMeta.wipeAllAccountsVer) > syncMeta.wipeAllAccountsVer) {
         syncMeta.wipeAllAccountsVer = Number(remMeta.wipeAllAccountsVer);
@@ -1019,6 +1360,40 @@ function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
         saveAccountsCache();
         changed = true;
         if (!fromReplay) showToast('⚡ Live DB: All scores reset.');
+    }
+
+    if (Number(remMeta.wipeAllMailVer) > syncMeta.wipeAllMailVer) {
+        syncMeta.wipeAllMailVer = Number(remMeta.wipeAllMailVer);
+        applyResetAllMessagesLocally();
+        saveSyncMeta();
+        changed = true;
+        if (!fromReplay) showToast('⚡ Live DB: All messages cleared.');
+    }
+
+    if (Number(remMeta.wipeAllSongsVer) > syncMeta.wipeAllSongsVer) {
+        syncMeta.wipeAllSongsVer = Number(remMeta.wipeAllSongsVer);
+        syncMeta.deletedSongVer = {};
+        saveSyncMeta();
+        clearAllLocalSongsStore().then(() => renderDevCustomSongsList());
+        changed = true;
+        if (!fromReplay) showToast('⚡ Live DB: All custom songs removed.');
+    }
+
+    if (remMeta.deletedSongVer && typeof remMeta.deletedSongVer === 'object') {
+        let songDelChanged = false;
+        Object.entries(remMeta.deletedSongVer).forEach(([u, ver]) => {
+            const remV = Number(ver) || 0, curV = Number(syncMeta.deletedSongVer[u]) || 0;
+            if (remV > curV) {
+                syncMeta.deletedSongVer[u] = remV;
+                delete songsMetaCache[u];
+                songDelChanged = true;
+            }
+        });
+        if (songDelChanged) {
+            saveSyncMeta(); saveSongsMetaCache();
+            applySongsSyncVersions();
+            changed = true;
+        }
     }
 
     if (remMeta.deletedUids && typeof remMeta.deletedUids === 'object') {
@@ -1046,24 +1421,45 @@ function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
         });
     }
 
+    if (remMeta.seasonState) {
+        if (applyRemoteSeasonState(remMeta.seasonState, !fromReplay)) changed = true;
+    }
+
+    return changed;
+}
+
+function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
+    if (!pkt || typeof pkt !== 'object') return;
+    if (pkt.pid) {
+        if (seenPacketIds.has(pkt.pid)) return;
+        seenPacketIds.add(pkt.pid);
+    }
+
+    ensureSyncMetaVersions();
+    let changed = false;
+    const remMeta = pkt.meta || {};
+
+    if (applyRemoteMetaEnvelope(remMeta, fromReplay)) changed = true;
+    if (pkt.seasonState && applyRemoteSeasonState(pkt.seasonState, !fromReplay)) changed = true;
+
+    if (pkt.songMeta && pkt.songMeta.uid) {
+        songsMetaCache[pkt.songMeta.uid] = pkt.songMeta;
+        saveSongsMetaCache();
+        changed = true;
+    }
+
     if (Array.isArray(pkt.accounts)) {
         pkt.accounts.forEach(rawAcc => {
             if (mergeSingleAccountRecord(rawAcc, fromReplay)) changed = true;
         });
     }
 
-    if (Array.isArray(remMeta.broadcastMails)) {
-        remMeta.broadcastMails.forEach(m => {
-            if (deliverBroadcastMailLocally(m, !fromReplay)) changed = true;
-        });
-    }
+    toArraySafe(remMeta.broadcastMails).forEach(m => {
+        if (deliverBroadcastMailLocally(m, !fromReplay)) changed = true;
+    });
 
     if (pkt.mail && pkt.mail.title && pkt.mail.body) {
         if (deliverBroadcastMailLocally(pkt.mail, !fromReplay)) changed = true;
-    }
-
-    if (pkt.seasonState) {
-        if (applyRemoteSeasonState(pkt.seasonState, !fromReplay)) changed = true;
     }
 
     if (changed) refreshAllLiveViews();
@@ -1110,7 +1506,33 @@ async function handleFirebasePulse(pulse) {
     } else if (op === 'mail_broadcast' && pulse.mail) {
         deliverBroadcastMailLocally(pulse.mail, true);
         refreshAllLiveViews();
-    } else if (op === 'season_sync') {
+    } else if (op === 'mail_reset_all') {
+        const nextVer = Math.max(Number(pulse.wipeAllMailVer) || 0, syncMeta.wipeAllMailVer + 1);
+        syncMeta.wipeAllMailVer = nextVer;
+        applyResetAllMessagesLocally();
+        saveSyncMeta();
+        refreshAllLiveViews();
+        showToast('⚡ Live DB: All messages cleared.');
+    } else if (op === 'song_upsert' && pulse.songMeta && pulse.songMeta.uid) {
+        songsMetaCache[pulse.songMeta.uid] = pulse.songMeta;
+        saveSongsMetaCache();
+        renderDevCustomSongsList();
+    } else if (op === 'song_delete' && pulse.uid) {
+        const nextV = Math.max(Number(pulse.songDelVer) || 0, (Number(syncMeta.deletedSongVer[pulse.uid]) || 0) + 1);
+        syncMeta.deletedSongVer[pulse.uid] = nextV;
+        delete songsMetaCache[pulse.uid];
+        saveSyncMeta(); saveSongsMetaCache();
+        await applySongsSyncVersions();
+        renderDevCustomSongsList();
+    } else if (op === 'songs_reset_all') {
+        const nextV = Math.max(Number(pulse.wipeAllSongsVer) || 0, syncMeta.wipeAllSongsVer + 1);
+        syncMeta.wipeAllSongsVer = nextV;
+        syncMeta.deletedSongVer = {};
+        saveSyncMeta();
+        await clearAllLocalSongsStore();
+        renderDevCustomSongsList();
+        showToast('⚡ Live DB: All custom songs removed.');
+    } else if (op === 'season_sync' || op === 'season_reset') {
         const remSeason = pulse.seasonState || await fbRequest('/meta/seasonState', 'GET');
         if (remSeason) applyRemoteSeasonState(remSeason, true);
         const remAccounts = await fbRequest('/accounts', 'GET');
@@ -1122,6 +1544,8 @@ async function handleFirebasePulse(pulse) {
 }
 
 function mergeScoreEntryLocally(entry, sNum, sScore) {
+    if (!entry || !entry.uid) return;
+    if (entry.uid !== CANONICAL_DEV_UID && syncMeta.deletedUids[entry.uid]) return;
     const scoreVal = Number(entry.score) || 0;
     if (scoreVal > 0) {
         const ai = lbAllCache.findIndex(e => e.uid === entry.uid);
@@ -1154,13 +1578,13 @@ function applyScoreResetLocally(uid) {
 function applyResetAllScoresLocally() {
     lbAllCache = []; lbSeasonCache = {}; saveLbAll(); saveLbSeason();
     Object.values(accountsCache).forEach(a => { a.stats.allTimeBest = 0; a.stats.bestEpoch = 1; a.stats.totalFlashes = 0; a.stats.seasonScores = {}; });
-    saveAccountsCache(); reconcileAllTimeChampion();
+    saveAccountsCache(); reconcileAllTimeChampion(false);
 }
 function applyAccountDeleteLocally(uid, notify) {
     if (!uid || uid === CANONICAL_DEV_UID) return;
     const existed = accountsCache[uid];
     delete accountsCache[uid]; saveAccountsCache();
-    removeUidFromLeaderboards(uid); deleteCustomSongByUid(uid);
+    removeUidFromLeaderboards(uid); deleteCustomSongByUid(uid, false);
     if (lastLoggedOutUid === uid) { lastLoggedOutUid = ''; lsRemove(STORAGE_LAST_OUT_KEY); }
     if (activeAccount && activeAccount.uid === uid) {
         activeAccount = null; lsRemove(STORAGE_ACTIVE_UID_KEY); resetAllRevealStates();
@@ -1172,7 +1596,7 @@ function applyDeleteAllNonDevLocally(wipeTs, notify, forceAll = true) {
     let removed = 0;
     Object.values(accountsCache).forEach(a => {
         if (!a.isDev && (forceAll || a.createdAt <= wipeTs)) {
-            delete accountsCache[a.uid]; removeUidFromLeaderboards(a.uid); deleteCustomSongByUid(a.uid);
+            delete accountsCache[a.uid]; removeUidFromLeaderboards(a.uid); deleteCustomSongByUid(a.uid, false);
             if (lastLoggedOutUid === a.uid) { lastLoggedOutUid = ''; lsRemove(STORAGE_LAST_OUT_KEY); }
             if (activeAccount && activeAccount.uid === a.uid) {
                 activeAccount = null; lsRemove(STORAGE_ACTIVE_UID_KEY); resetAllRevealStates();
@@ -1189,6 +1613,7 @@ function applyDeleteAllNonDevLocally(wipeTs, notify, forceAll = true) {
 async function pullCloudHistoryAndSync(sendPushAfter = false) {
     if (!FB_BASE_URL) {
         setRealtimeStatusUI('local');
+        if (seasonStateCache.seasonVer === 0) { seasonStateCache.seasonVer = 1; saveSeasonState(); }
         return;
     }
     if (isPullingCloud || document.hidden || isPortalExiting) return;
@@ -1201,7 +1626,24 @@ async function pullCloudHistoryAndSync(sendPushAfter = false) {
                 seenPacketIds.add(snap.pulse.pid);
             }
             const remMeta = snap.meta || {};
-            // Merge leaderboards from Firebase first so finalizeSeason has full rankings
+            // 1. Apply meta & season state FIRST (before accounts & leaderboards)
+            applyRemoteMetaEnvelope(remMeta, true);
+
+            // 2. Sync songsMeta registry & prune wiped/deleted local IndexedDB songs
+            if (snap.songsMeta && typeof snap.songsMeta === 'object') {
+                songsMetaCache = { ...snap.songsMeta };
+                saveSongsMetaCache();
+            } else if (syncMeta.wipeAllSongsVer > 0) {
+                songsMetaCache = {};
+                saveSongsMetaCache();
+            }
+            await applySongsSyncVersions();
+
+            // 3. Merge accounts from cloud
+            const remAccounts = snap.accounts && typeof snap.accounts === 'object' ? Object.values(snap.accounts) : [];
+            remAccounts.forEach(rawAcc => mergeSingleAccountRecord(rawAcc, true));
+
+            // 4. Merge leaderboards (only non-deleted accounts)
             if (snap.leaderboards && typeof snap.leaderboards === 'object') {
                 if (snap.leaderboards.alltime && typeof snap.leaderboards.alltime === 'object') {
                     Object.values(snap.leaderboards.alltime).forEach(e => {
@@ -1219,27 +1661,33 @@ async function pullCloudHistoryAndSync(sendPushAfter = false) {
                     });
                 }
             }
-            const remAccounts = snap.accounts && typeof snap.accounts === 'object' ? Object.values(snap.accounts) : [];
-            applyIncomingRealtimeEvent({
-                type: 'rs_sync_v12',
-                pid: 'boot_' + Date.now(),
-                op: remMeta.latestMail ? 'mail_broadcast' : 'state_sync',
-                meta: remMeta,
-                seasonState: remMeta.seasonState || null,
-                mail: remMeta.latestMail || null,
-                accounts: remAccounts
-            }, true);
 
-            // If Firebase didn't have seasonState yet, initialize it once so all devices share the exact clock
+            // 5. Deliver eligible broadcasts (respects createdAt & deletedMailIds & readMailIds)
+            const bcList = toArraySafe(remMeta.broadcastMails);
+            if (remMeta.latestMail && remMeta.latestMail.id && !bcList.some(m => m.id === remMeta.latestMail.id)) {
+                bcList.unshift(remMeta.latestMail);
+            }
+            bcList.forEach(m => deliverBroadcastMailLocally(m, false));
+
+            // 6. Initialize Firebase seasonState once if DB is brand new
             if (!remMeta.seasonState) {
+                if (seasonStateCache.seasonVer === 0) { seasonStateCache.seasonVer = 1; saveSeasonState(); }
                 await fbRequest('/meta/seasonState', 'PUT', getSharedSeasonPayload());
             }
+
+            if (lastLoggedOutUid && !accountsCache[lastLoggedOutUid]) {
+                lastLoggedOutUid = ''; lsRemove(STORAGE_LAST_OUT_KEY);
+            }
+            refreshAllLiveViews();
+        } else {
+            if (seasonStateCache.seasonVer === 0) { seasonStateCache.seasonVer = 1; saveSeasonState(); }
         }
         setRealtimeStatusUI('live');
-        if (sendPushAfter && activeAccount) {
+        if (sendPushAfter && activeAccount && activeAccount.editVer > 0) {
             await fbRequest(`/accounts/${activeAccount.uid}`, 'PUT', packAccountForSync(activeAccount));
         }
     } catch (e) {
+        if (seasonStateCache.seasonVer === 0) { seasonStateCache.seasonVer = 1; saveSeasonState(); }
         setRealtimeStatusUI('local');
     } finally {
         isPullingCloud = false;
@@ -1291,7 +1739,11 @@ if (localBc) localBc.onmessage = ev => { if (ev && ev.data) applyIncomingRealtim
 
 window.addEventListener('storage', ev => {
     if (!ev || !ev.key) return;
-    if ([STORAGE_ACCOUNTS_KEY, STORAGE_LB_ALL_KEY, STORAGE_LB_SEASON_KEY, STORAGE_SYNC_META_KEY, STORAGE_SEASON_KEY].includes(ev.key)) {
+    if ([STORAGE_ACCOUNTS_KEY, STORAGE_LB_ALL_KEY, STORAGE_LB_SEASON_KEY, STORAGE_SYNC_META_KEY, STORAGE_SEASON_KEY, STORAGE_SONGS_META_KEY].includes(ev.key)) {
+        const freshMeta = lsGetJson(STORAGE_SYNC_META_KEY, null);
+        if (freshMeta && typeof freshMeta === 'object') { Object.assign(syncMeta, freshMeta); ensureSyncMetaVersions(); }
+        const freshSongs = lsGetJson(STORAGE_SONGS_META_KEY, null);
+        if (freshSongs && typeof freshSongs === 'object') songsMetaCache = freshSongs;
         const freshAcc = lsGetJson(STORAGE_ACCOUNTS_KEY, null);
         if (freshAcc && typeof freshAcc === 'object') {
             accountsCache = freshAcc; validateAndSanitizeDatabase();
@@ -1304,6 +1756,7 @@ window.addEventListener('storage', ev => {
         if (freshSeason && typeof freshSeason === 'object') seasonStateCache = freshSeason;
         const freshAll = lsGetJson(STORAGE_LB_ALL_KEY, null); if (Array.isArray(freshAll)) lbAllCache = freshAll;
         const freshSea = lsGetJson(STORAGE_LB_SEASON_KEY, null); if (freshSea && typeof freshSea === 'object') lbSeasonCache = freshSea;
+        applySongsSyncVersions();
         refreshAllLiveViews();
     }
 });
@@ -1336,19 +1789,34 @@ function getSkinStatusLabel(acc, skinId) {
     const sk = (acc.seasonalSkins || []).find(x => x.skinId === skinId && x.claimed && !x.expired && ((st.phase === 'ACTIVE' && x.validForSeason === st.seasonNum) || (st.phase === 'GAP' && x.validForSeason === st.seasonNum + 1)));
     return sk ? `Active • Expires End of S${sk.validForSeason}` : 'Top 5 Season Reward';
 }
-function reconcileAllTimeChampion() {
+function reconcileAllTimeChampion(notifyMail = false) {
     const newChampUid = getAllTimeTop1Uid(), prevChampUid = lsGet(STORAGE_ALLTIME_CHAMP, '') || '';
+    const topScore = (lbAllCache[0] && Number(lbAllCache[0].score)) || 0;
     let mod = false;
     if (newChampUid !== prevChampUid) {
-        if (prevChampUid && accountsCache[prevChampUid] && !accountsCache[prevChampUid].isDev) {
-            const pAcc = accountsCache[prevChampUid];
-            if (pAcc.custom.nitroSkin === 'void_chroma') pAcc.custom.nitroSkin = 'standard';
-            pushMail(pAcc, { title: 'All-Time #1 Crown Claimed by Rival', sender: 'SYSTEM', body: 'Another pilot took #1 on the All-Time leaderboard. Reclaim #1 All-Time to re-unlock Void Prismatic FX!' });
-            mod = true;
-        }
-        if (newChampUid && accountsCache[newChampUid]) {
-            pushMail(accountsCache[newChampUid], { title: '👑 All-Time #1: Void Prismatic FX Unlocked!', sender: 'HALL OF FAME', body: 'You hold #1 on the All-Time leaderboard! Void Prismatic FX (All-in-One Chroma + Singularity Afterburner) is now unlocked in your Garage.' });
-            mod = true;
+        if (notifyMail) {
+            if (prevChampUid && accountsCache[prevChampUid] && !accountsCache[prevChampUid].isDev) {
+                const pAcc = accountsCache[prevChampUid];
+                if (pAcc.custom.nitroSkin === 'void_chroma') pAcc.custom.nitroSkin = 'standard';
+                pushMail(pAcc, {
+                    id: `hof_loss_${prevChampUid}_${topScore}`,
+                    kind: 'hof',
+                    title: 'All-Time #1 Crown Overtaken',
+                    sender: 'HALL OF FAME',
+                    body: `STATUS: A rival claimed #1 All-Time (${topScore.toLocaleString()} pts)\nACTION: Reclaim #1 All-Time to re-unlock Void Prismatic FX`
+                });
+                mod = true;
+            }
+            if (newChampUid && accountsCache[newChampUid]) {
+                pushMail(accountsCache[newChampUid], {
+                    id: `hof_gain_${newChampUid}_${topScore}`,
+                    kind: 'hof',
+                    title: 'All-Time #1 Crown Claimed',
+                    sender: 'HALL OF FAME',
+                    body: `STATUS: #1 All-Time Leaderboard (${topScore.toLocaleString()} pts)\nUNLOCK: Void Prismatic FX (All-in-One Chroma) is now active in Garage`
+                });
+                mod = true;
+            }
         }
         if (newChampUid) lsSet(STORAGE_ALLTIME_CHAMP, newChampUid); else lsRemove(STORAGE_ALLTIME_CHAMP);
     }
@@ -1364,50 +1832,73 @@ function formatCountdown(ms) {
     if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m`;
     return `${m}m ${String(s).padStart(2, '0')}s`;
 }
-function pushMail(acc, { title, sender = 'SYSTEM', body, reward = null, id = null }) {
-    if (!acc) return;
+function pushMail(acc, { title, sender = 'SYSTEM', body, reward = null, id = null, kind = 'system', seasonNum = 0, ts = null }) {
+    if (!acc) return false;
     if (!Array.isArray(acc.inbox)) acc.inbox = [];
-    const mid = id || ('m_' + Date.now() + '_' + Math.floor(Math.random() * 1e6));
-    if (acc.inbox.some(m => m.id === mid)) return; // Prevent duplicate mails across devices
-    acc.inbox.unshift({ id: mid, title, sender, body, ts: Date.now(), read: false, reward });
-    if (acc.inbox.length > 50) acc.inbox.length = 50;
+    if (!acc.deletedMailIds || typeof acc.deletedMailIds !== 'object') acc.deletedMailIds = {};
+    if (!acc.readMailIds || typeof acc.readMailIds !== 'object') acc.readMailIds = {};
+    const mid = sanitizeDbKey(id || ('m_' + Date.now() + '_' + Math.floor(Math.random() * 1e6)));
+    // Phone-style rule: never resurrect deleted mail or duplicate existing mail
+    if (acc.deletedMailIds[mid]) return false;
+    if (acc.inbox.some(m => sanitizeDbKey(m.id) === mid)) return false;
+    const mailTs = Number(ts) || Date.now();
+    if (kind === 'broadcast' && mailTs < (Number(acc.createdAt) || 0)) return false;
+    if (kind === 'season' && seasonNum > 0 && seasonNum < (Number(acc.joinedSeason) || 1)) return false;
+    const isRead = Boolean(acc.readMailIds[mid]);
+    acc.inbox.unshift({ id: mid, kind, seasonNum, title, sender, body, ts: mailTs, read: isRead, reward });
+    if (acc.inbox.length > 40) acc.inbox.length = 40;
+    return true;
 }
-function pushMailAll(spec) {
-    const mid = spec.id || ('m_' + Date.now() + '_' + Math.floor(Math.random() * 1e6));
-    const mailObj = { id: mid, title: spec.title, sender: spec.sender || 'SYSTEM', body: spec.body, ts: Date.now(), read: false, reward: null };
-    Object.values(accountsCache).forEach(acc => pushMail(acc, mailObj));
-    saveAccountsCache(); return mailObj;
-}
-function syncSeasonLifecycle() {
+function syncSeasonLifecycle(pushToCloud = false) {
     seasonStatusCache = computeSeasonStatus();
     const st = seasonStatusCache;
+    const resetVer = Number(seasonStateCache.seasonResetVer) || 0;
+    const targetFinalized = (st.phase === 'GAP') ? st.seasonNum : Math.max(0, st.seasonNum - 1);
+
+    // Do not replay historical seasons before cloud confirms authoritative seasonState
+    if ((Number(seasonStateCache.seasonVer) || 0) === 0) {
+        seasonStateCache.lastFinalizedSeason = targetFinalized;
+        seasonStateCache.lastAnnouncedSeason = st.seasonNum;
+        return;
+    }
+
     let changed = false;
-    const targetFinalized = (st.phase === 'GAP') ? st.seasonNum : (st.seasonNum - 1);
     while ((Number(seasonStateCache.lastFinalizedSeason) || 0) < targetFinalized) {
         const ended = (Number(seasonStateCache.lastFinalizedSeason) || 0) + 1;
         finalizeSeason(ended);
         seasonStateCache.lastFinalizedSeason = ended;
         changed = true;
     }
+
     if (st.phase === 'ACTIVE' && (Number(seasonStateCache.lastAnnouncedSeason) || 0) < st.seasonNum) {
         const feat = getSeasonFeaturedSkin(st.seasonNum);
-        pushMailAll({
-            id: `season_${st.seasonNum}_started`,
-            title: `Season ${st.seasonNum} Started`,
-            sender: 'SEASON ENGINE',
-            body: `Season ${st.seasonNum} is live for 3 days (followed by a 1-day off-season gap).\n\nFinish Top 5 in Season ${st.seasonNum} to unlock "${feat.name}" (All-in-One Chroma) for Season ${st.seasonNum + 1}. Hold #1 All-Time to wield Void Prismatic FX!`
+        const startMailId = `season_${st.seasonNum}_started_v${resetVer}`;
+        Object.values(accountsCache).forEach(acc => {
+            if ((Number(acc.joinedSeason) || 1) > st.seasonNum) return;
+            pushMail(acc, {
+                id: startMailId,
+                kind: 'season',
+                seasonNum: st.seasonNum,
+                title: `Season ${st.seasonNum} Live`,
+                sender: 'SEASON ENGINE',
+                body: `STATUS: Season ${st.seasonNum} Active (3d)\nTOP 5 REWARD: ${feat.name} (valid for S${st.nextSeasonNum})\nALL-TIME #1: Void Prismatic FX (All-in-One Chroma)\nNEXT PHASE: 24h Off-Season Gap after Season ${st.seasonNum}`
+            });
         });
+        saveAccountsCache();
         seasonStateCache.lastAnnouncedSeason = st.seasonNum;
         changed = true;
     }
+
     if (changed) {
         saveSeasonState();
+        if (pushToCloud && FB_BASE_URL) {
+            fbRequest('/meta/seasonState', 'PUT', getSharedSeasonPayload());
+        }
         refreshSeasonUI();
         refreshInboxBadgeUI();
     }
 }
 function finalizeSeason(endedSeason) {
-    // Ensure season leaderboard has all recorded scores from accountsCache before finalizing
     Object.values(accountsCache).forEach(acc => {
         const pts = (acc.stats && acc.stats.seasonScores && Number(acc.stats.seasonScores[endedSeason])) || 0;
         if (pts > 0) {
@@ -1420,12 +1911,16 @@ function finalizeSeason(endedSeason) {
         }
     });
     const sLb = getSeasonLbFor(endedSeason), rewardSkin = getSeasonFeaturedSkin(endedSeason), nextSeason = endedSeason + 1;
+    const resetVer = Number(seasonStateCache.seasonResetVer) || 0;
     const top5 = new Map();
     sLb.slice(0, 5).forEach((e, i) => top5.set(e.uid, { rank: i + 1, score: e.score }));
 
     Object.values(accountsCache).forEach(acc => {
+        // Players who joined after endedSeason NEVER receive previous season messages
+        if ((Number(acc.joinedSeason) || 1) > endedSeason) return;
+
+        const expNames = [];
         if (!acc.isDev && Array.isArray(acc.seasonalSkins)) {
-            const expNames = [];
             acc.seasonalSkins.forEach(sk => {
                 if (!sk.expired && sk.validForSeason <= endedSeason) {
                     sk.expired = true;
@@ -1433,37 +1928,39 @@ function finalizeSeason(endedSeason) {
                     expNames.push(m ? m.name : sk.skinId);
                 }
             });
-            if (expNames.length) {
-                if (acc.custom.nitroSkin !== 'standard' && !hasNitroSkinUnlocked(acc, acc.custom.nitroSkin)) acc.custom.nitroSkin = 'standard';
-                pushMail(acc, {
-                    id: `season_${endedSeason}_expired_${acc.uid}`,
-                    title: `Seasonal Skin Expired (S${endedSeason})`,
-                    sender: 'GARAGE',
-                    body: `Your seasonal reward (${expNames.join(', ')}) expired at the end of Season ${endedSeason}.`
-                });
+            if (expNames.length && acc.custom.nitroSkin !== 'standard' && !hasNitroSkinUnlocked(acc, acc.custom.nitroSkin)) {
+                acc.custom.nitroSkin = 'standard';
             }
         }
+
         const win = top5.get(acc.uid);
+        let rewardObj = null;
         if (win) {
             if (!Array.isArray(acc.seasonalSkins)) acc.seasonalSkins = [];
             if (!acc.seasonalSkins.some(s => s.skinId === rewardSkin.id && s.validForSeason === nextSeason)) {
                 acc.seasonalSkins.push({ skinId: rewardSkin.id, wonSeason: endedSeason, validForSeason: nextSeason, claimed: false, expired: false, rank: win.rank });
             }
-            pushMail(acc, {
-                id: `season_${endedSeason}_reward_${acc.uid}`,
-                title: `🏆 Season ${endedSeason} Top 5 (#${win.rank})`,
-                sender: 'REWARDS',
-                body: `Finished #${win.rank} in Season ${endedSeason} (${win.score.toLocaleString()} pts).\nClaim "${rewardSkin.name}" (All-in-One Chroma) below — active for Season ${nextSeason}.`,
-                reward: { skinId: rewardSkin.id, skinName: rewardSkin.name, wonSeason: endedSeason, validForSeason: nextSeason, rank: win.rank, claimed: false }
-            });
+            rewardObj = { skinId: rewardSkin.id, skinName: rewardSkin.name, wonSeason: endedSeason, validForSeason: nextSeason, rank: win.rank, claimed: false };
         }
+
+        // Single structured, non-redundant Season Results mail combining rank, reward & expirations
         const rankIdx = sLb.findIndex(e => e.uid === acc.uid);
         const pts = (acc.stats.seasonScores && acc.stats.seasonScores[endedSeason]) || (win ? win.score : 0);
+        const lines = [
+            `FINAL RANK: ${rankIdx >= 0 ? `#${rankIdx + 1} (${pts.toLocaleString()} pts)` : 'Unranked (no runs recorded)'}`
+        ];
+        if (win) lines.push(`TOP 5 REWARD: ${rewardSkin.name} unlocked for Season ${nextSeason} — claim below`);
+        if (expNames.length) lines.push(`EXPIRED SKINS: ${expNames.join(', ')}`);
+        lines.push(`NEXT PHASE: 24h Off-Season Gap before Season ${nextSeason}`);
+
         pushMail(acc, {
-            id: `season_${endedSeason}_end_${acc.uid}`,
-            title: `Season ${endedSeason} Ended`,
+            id: `season_${endedSeason}_results_v${resetVer}_${acc.uid}`,
+            kind: 'season',
+            seasonNum: endedSeason,
+            title: win ? `Season ${endedSeason} Results — Top 5 (#${win.rank})` : `Season ${endedSeason} Results`,
             sender: 'SEASON ENGINE',
-            body: `${rankIdx >= 0 ? `Final Rank: #${rankIdx + 1} (${pts.toLocaleString()} pts)` : 'No ranked runs recorded.'}\n\n24h Off-Season Gap is now active before Season ${nextSeason}.`
+            body: lines.join('\n'),
+            reward: rewardObj
         });
     });
     saveAccountsCache();
@@ -1481,17 +1978,17 @@ function recordScoreToLeaderboards(acc, scoreVal, epochVal) {
     const entry = { uid: acc.uid, name: acc.name, tag: acc.tag, isDev: acc.isDev, score: scoreVal, epoch: epochVal, accent: acc.custom.bodySecondary, skinId: acc.custom.nitroSkin, isPrism: acc.custom.nitroSkin === 'void_chroma', ts: nowTs };
     const sNum = st.phase === 'ACTIVE' ? st.seasonNum : 0, sScore = sNum ? (acc.stats.seasonScores[sNum] || scoreVal) : 0;
     mergeScoreEntryLocally(entry, sNum, sScore);
-    reconcileAllTimeChampion(); updateTopLeaderBanner();
+    reconcileAllTimeChampion(true); updateTopLeaderBanner();
     publishRealtimeEvent('score_record', { entry, sNum, sScore });
 }
 function removeUidFromLeaderboards(uid) {
     lbAllCache = lbAllCache.filter(e => e.uid !== uid); saveLbAll();
     Object.keys(lbSeasonCache).forEach(k => { if (Array.isArray(lbSeasonCache[k])) lbSeasonCache[k] = lbSeasonCache[k].filter(e => e.uid !== uid); });
-    saveLbSeason(); reconcileAllTimeChampion(); updateTopLeaderBanner();
+    saveLbSeason(); reconcileAllTimeChampion(false); updateTopLeaderBanner();
 }
 
 // =========================================================================
-// 9. AUDIO ENGINE & INDEXEDDB ARRAYBUFFER SONG STORAGE
+// 9. AUDIO ENGINE & INDEXEDDB + CLOUD SYNCED SONG STORAGE
 // =========================================================================
 let audioCtx = null, compressorNode = null, masterGain = null, musicBus = null, sfxBus = null;
 let engineOsc1 = null, engineOsc2 = null, engineSub = null, engineTurbo = null, engineFilter = null, engineGain = null, engineTurboGain = null, engineLfo = null, engineLfoGain = null;
@@ -1776,24 +2273,28 @@ async function handleCustomSongUpload(files) {
     try {
         const arrayBuf = await f.arrayBuffer();
         const mimeType = f.type || 'audio/mpeg';
+        const nowTs = Date.now();
+        const songVer = Number(syncMeta.wipeAllSongsVer) || 0;
+        const indivSongVer = Number(syncMeta.deletedSongVer[activeAccount.uid]) || 0;
+        const pilotName = `${activeAccount.name} #${activeAccount.tag}`;
         const db = await openLocalIDB();
         await new Promise((res, rej) => {
             const tx = db.transaction('songs', 'readwrite');
             tx.objectStore('songs').put({
-                uid: activeAccount.uid,
-                pilotName: `${activeAccount.name} #${activeAccount.tag}`,
-                fileName: f.name,
-                sizeBytes: f.size,
-                mimeType,
-                buffer: arrayBuf,
-                ts: Date.now()
+                uid: activeAccount.uid, pilotName, fileName: f.name, sizeBytes: f.size,
+                mimeType, buffer: arrayBuf, ts: nowTs, songVer, indivSongVer
             });
             tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
         });
-        await loadCustomSongForActiveAccount(); selectOstMode('custom');
+        songsMetaCache[activeAccount.uid] = { uid: activeAccount.uid, pilotName, fileName: f.name, sizeBytes: f.size, ts: nowTs, songVer, indivSongVer };
+        saveSongsMetaCache();
+        publishRealtimeEvent('song_upsert', { songMeta: songsMetaCache[activeAccount.uid] });
+        await loadCustomSongForActiveAccount();
+        selectOstMode('custom');
         showToast(`Loaded track into IndexedDB: ${f.name}`, 'ok'); playSfx('pickup');
     } catch (e) { setTextCached('customSongStatusText', '✕ Upload failed'); showToast('Track upload failed.', 'err'); }
 }
+
 async function loadCustomSongForActiveAccount() {
     const stEl = document.getElementById('customSongStatusText'), subEl = document.getElementById('customOstBtnSub'), rmBtn = document.getElementById('removeMyCustomSongBtn');
     if (customSongObjUrl) { URL.revokeObjectURL(customSongObjUrl); customSongObjUrl = null; }
@@ -1805,6 +2306,11 @@ async function loadCustomSongForActiveAccount() {
     try {
         const db = await openLocalIDB();
         const rec = await new Promise(res => { const req = db.transaction('songs', 'readonly').objectStore('songs').get(activeAccount.uid); req.onsuccess = () => res(req.result || null); req.onerror = () => res(null); });
+        const stale = rec && ((Number(rec.songVer) || 0) < (Number(syncMeta.wipeAllSongsVer) || 0) || (Number(rec.indivSongVer) || 0) < (Number(syncMeta.deletedSongVer[activeAccount.uid]) || 0));
+        if (rec && stale) {
+            await deleteCustomSongByUid(activeAccount.uid, false);
+            return;
+        }
         if (rec && (rec.buffer || rec.blob)) {
             const blobObj = rec.buffer ? new Blob([rec.buffer], { type: rec.mimeType || 'audio/mpeg' }) : rec.blob;
             customSongObjUrl = URL.createObjectURL(blobObj);
@@ -1819,22 +2325,106 @@ async function loadCustomSongForActiveAccount() {
         renderDevCustomSongsList();
     } catch (e) {}
 }
-async function removeCurrentPilotCustomSong() { if (activeAccount) { await deleteCustomSongByUid(activeAccount.uid); showToast('Custom track removed.'); playSfx('uiClick'); } }
-async function deleteCustomSongByUid(uid) {
+
+async function clearAllLocalSongsStore() {
+    if (customSongObjUrl) { URL.revokeObjectURL(customSongObjUrl); customSongObjUrl = null; }
+    customAudio.pause(); customAudio.removeAttribute('src');
+    songsMetaCache = {};
+    saveSongsMetaCache();
     try {
         const db = await openLocalIDB();
-        await new Promise(res => { const tx = db.transaction('songs', 'readwrite'); tx.objectStore('songs').delete(uid); tx.oncomplete = () => res(); tx.onerror = () => res(); });
-        if (activeAccount && activeAccount.uid === uid) await loadCustomSongForActiveAccount(); else renderDevCustomSongsList();
+        await new Promise(res => {
+            const tx = db.transaction('songs', 'readwrite');
+            tx.objectStore('songs').clear();
+            tx.oncomplete = () => res(); tx.onerror = () => res();
+        });
     } catch (e) {}
+    const stEl = document.getElementById('customSongStatusText'), subEl = document.getElementById('customOstBtnSub'), rmBtn = document.getElementById('removeMyCustomSongBtn');
+    if (stEl) stEl.innerText = 'Custom Track (≤ 20 MB)';
+    if (subEl) subEl.innerText = 'None';
+    if (rmBtn) rmBtn.classList.add('hidden');
+    if (globalSettings.audio.ostMode === 'custom') selectOstMode('synth');
 }
+
+async function applySongsSyncVersions() {
+    let activeRemoved = false;
+    try {
+        const db = await openLocalIDB();
+        const list = await new Promise(res => {
+            const req = db.transaction('songs', 'readonly').objectStore('songs').getAll();
+            req.onsuccess = () => res(req.result || []); req.onerror = () => res([]);
+        });
+        const toDelete = list.filter(r =>
+            r && r.uid && (
+                (Number(r.songVer) || 0) < (Number(syncMeta.wipeAllSongsVer) || 0) ||
+                (Number(r.indivSongVer) || 0) < (Number(syncMeta.deletedSongVer[r.uid]) || 0)
+            )
+        );
+        if (toDelete.length) {
+            await new Promise(res => {
+                const tx = db.transaction('songs', 'readwrite');
+                const store = tx.objectStore('songs');
+                toDelete.forEach(r => {
+                    store.delete(r.uid);
+                    if (activeAccount && activeAccount.uid === r.uid) activeRemoved = true;
+                });
+                tx.oncomplete = () => res(); tx.onerror = () => res();
+            });
+        }
+    } catch (e) {}
+    let metaDirty = false;
+    Object.keys(songsMetaCache).forEach(u => {
+        const m = songsMetaCache[u];
+        if (!m || (Number(m.songVer) || 0) < (Number(syncMeta.wipeAllSongsVer) || 0) || (Number(m.indivSongVer) || 0) < (Number(syncMeta.deletedSongVer[u]) || 0)) {
+            delete songsMetaCache[u]; metaDirty = true;
+        }
+    });
+    if (metaDirty) saveSongsMetaCache();
+    if (activeRemoved) await loadCustomSongForActiveAccount();
+    else renderDevCustomSongsList();
+}
+
+async function removeCurrentPilotCustomSong() {
+    if (activeAccount) {
+        await deleteCustomSongByUid(activeAccount.uid, true);
+        showToast('Custom track removed.'); playSfx('uiClick');
+    }
+}
+
+async function deleteCustomSongByUid(uid, syncToDb = false) {
+    if (!uid) return;
+    delete songsMetaCache[uid];
+    saveSongsMetaCache();
+    try {
+        const db = await openLocalIDB();
+        await new Promise(res => {
+            const tx = db.transaction('songs', 'readwrite');
+            tx.objectStore('songs').delete(uid);
+            tx.oncomplete = () => res(); tx.onerror = () => res();
+        });
+    } catch (e) {}
+    if (syncToDb) publishRealtimeEvent('song_delete', { uid, ts: Date.now() });
+    if (activeAccount && activeAccount.uid === uid) await loadCustomSongForActiveAccount();
+    else renderDevCustomSongsList();
+}
+
 async function renderDevCustomSongsList() {
     const el = document.getElementById('devCustomSongsList');
     if (!el || !activeAccount || !activeAccount.isDev) return;
     try {
-        const db = await openLocalIDB();
-        const list = await new Promise(res => { const req = db.transaction('songs', 'readonly').objectStore('songs').getAll(); req.onsuccess = () => res(req.result || []); req.onerror = () => res([]); });
-        if (!list.length) { el.innerHTML = '<div style="color:var(--text-dim);">None</div>'; return; }
-        el.innerHTML = list.map(r => `<div class="row-between recessed-well" style="padding:4px 8px;"><span class="truncate mono">${escapeHtml(r.pilotName)}: <strong>${escapeHtml(r.fileName)}</strong></span><button type="button" class="btn btn-xs btn-danger" onclick="deleteCustomSongByUid('${escapeHtml(r.uid)}')">✕</button></div>`).join('');
+        const merged = new Map();
+        Object.values(songsMetaCache).forEach(m => { if (m && m.uid) merged.set(m.uid, m); });
+        try {
+            const db = await openLocalIDB();
+            const list = await new Promise(res => { const req = db.transaction('songs', 'readonly').objectStore('songs').getAll(); req.onsuccess = () => res(req.result || []); req.onerror = () => res([]); });
+            list.forEach(r => { if (r && r.uid) merged.set(r.uid, { uid: r.uid, pilotName: r.pilotName, fileName: r.fileName, sizeBytes: r.sizeBytes, local: true }); });
+        } catch (e) {}
+        const all = Array.from(merged.values());
+        if (!all.length) { el.innerHTML = '<div style="color:var(--text-dim);">None</div>'; return; }
+        el.innerHTML = all.map(r => {
+            const mb = r.sizeBytes ? ` (${(r.sizeBytes / 1048576).toFixed(1)} MB)` : '';
+            return `<div class="row-between recessed-well" style="padding:4px 8px;"><span class="truncate mono">${escapeHtml(r.pilotName || r.uid)}: <strong>${escapeHtml(r.fileName || 'Track')}</strong>${mb}</span><button type="button" class="btn btn-xs btn-danger" onclick="deleteCustomSongByUid('${escapeHtml(r.uid)}',true)">✕</button></div>`;
+        }).join('');
     } catch (e) {}
 }
 
@@ -2983,19 +3573,29 @@ function switchAuthSubTab(mode) {
     document.getElementById('authTabLogin').className = mode === 'login' ? 'btn btn-xs btn-sky active' : 'btn btn-xs';
 }
 
+let isSigningInUid = false;
+
 function createNewPilotAccount() {
     const nameEl = document.getElementById('regNameInput'), tagEl = document.getElementById('regTagInput');
     const name = (nameEl.value || '').trim(), tag = (tagEl.value || '').trim();
     if (!name || name.length < 2) { showAuthFeedback('Enter a name (min 2 chars).', false); playSfx('hit'); return; }
     if (!tag) { showAuthFeedback('Enter an ID / Tag.', false); playSfx('hit'); return; }
 
-    const uid = generateUnique17DigitUid();
-    const acc = makeAccountObj({ uid, name, tag, isDev: false });
+    seasonStatusCache = computeSeasonStatus();
     const st = seasonStatusCache;
+    const uid = generateUnique17DigitUid();
+    const acc = makeAccountObj({ uid, name, tag, isDev: false, joinedSeason: st.seasonNum, editVer: 1 });
     pushMail(acc, {
         id: `welcome_${uid}`,
-        title: `Welcome, ${acc.name}`, sender: 'SYSTEM',
-        body: `Account created: ${acc.name} #${acc.tag}\nYour unique 17-digit UID can be revealed & copied anytime in Profile.\n\nSeason ${st.seasonNum} is ${st.phase === 'ACTIVE' ? `LIVE — Top 5 earn "${st.featuredSkin.name}" for Season ${st.nextSeasonNum}.` : `in 24h Off-Season Gap before Season ${st.nextSeasonNum}.`}\nReach #1 All-Time to wield Void Prismatic FX!`
+        kind: 'system',
+        title: `Welcome, ${acc.name}`,
+        sender: 'SYSTEM',
+        body: [
+            `PILOT: ${acc.name} (#${acc.tag})`,
+            `SEASON ${st.seasonNum}: ${st.phase === 'ACTIVE' ? `Active — Top 5 earn ${st.featuredSkin.name} for S${st.nextSeasonNum}` : `Off-Season Gap before Season ${st.nextSeasonNum}`}`,
+            `HALL OF FAME: Reach #1 All-Time to wield Void Prismatic FX`,
+            `UID TIP: Reveal & copy your 17-digit UID anytime inside Profile`
+        ].join('\n')
     });
     accountsCache[uid] = acc; saveAccountsCache();
     publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(acc) });
@@ -3005,27 +3605,76 @@ function createNewPilotAccount() {
 }
 
 async function signInWithUid() {
+    if (isSigningInUid) return;
     const inp = document.getElementById('loginUidInput'), uid = (inp.value || '').replace(/\D+/g, '');
     if (!/^\d{17}$/.test(uid)) { showAuthFeedback('Enter a valid 17-digit UID.', false); playSfx('hit'); return; }
-    if (FB_BASE_URL) {
-        if (!accountsCache[uid]) showAuthFeedback('Looking up 17-digit UID in Firebase Cloud DB...', true);
-        const remAcc = await fbRequest(`/accounts/${uid}`, 'GET', null, 4500);
-        if (remAcc && remAcc.uid === uid) {
-            mergeSingleAccountRecord(remAcc, true);
+
+    isSigningInUid = true;
+    try {
+        if (uid === CANONICAL_DEV_UID) ensureCanonicalDevAccount();
+        if (FB_BASE_URL) {
+            showAuthFeedback('Signing in & syncing cloud DB...', true);
+            const [remAcc, remMeta] = await Promise.all([
+                fbRequest(`/accounts/${uid}`, 'GET', null, 3000),
+                fbRequest('/meta', 'GET', null, 3000)
+            ]);
+            // 1. Apply meta versions & season state first
+            if (remMeta && typeof remMeta === 'object') {
+                applyRemoteMetaEnvelope(remMeta, true);
+            }
+            // 2. Load/merge the target account (preserving readMailIds, deletedMailIds, createdAt, joinedSeason)
+            if (remAcc && remAcc.uid === uid) {
+                mergeSingleAccountRecord(remAcc, true);
+            } else if (uid !== CANONICAL_DEV_UID && syncMeta.deletedUids[uid]) {
+                applyAccountDeleteLocally(uid, false);
+            }
+            // 3. Deliver only eligible non-deleted broadcasts sent AFTER account creation
+            if (remMeta && typeof remMeta === 'object') {
+                const bcList = toArraySafe(remMeta.broadcastMails);
+                if (remMeta.latestMail && remMeta.latestMail.id && !bcList.some(m => m.id === remMeta.latestMail.id)) {
+                    bcList.unshift(remMeta.latestMail);
+                }
+                bcList.forEach(m => deliverBroadcastMailLocally(m, false));
+            }
         }
+        if (uid === CANONICAL_DEV_UID) ensureCanonicalDevAccount();
+        if (!accountsCache[uid]) {
+            showAuthFeedback('UID not found. Check your 17-digit UID or create a new pilot.', false);
+            playSfx('hit');
+            return;
+        }
+        inp.value = '';
+        activateAccountSession(uid);
+        showToast(`Signed in as ${activeAccount.name}`, 'ok'); playSfx('pickup');
+    } finally {
+        isSigningInUid = false;
     }
-    if (!accountsCache[uid]) { showAuthFeedback('UID not found. Check your 17-digit UID or create a new pilot.', false); playSfx('hit'); return; }
-    inp.value = '';
-    activateAccountSession(uid);
-    showToast(`Signed in as ${activeAccount.name}`, 'ok'); playSfx('pickup');
 }
 
 function activateAccountSession(uid) {
+    if (uid === CANONICAL_DEV_UID) ensureCanonicalDevAccount();
     const acc = accountsCache[uid]; if (!acc) return;
     activeAccount = acc; lsSet(STORAGE_ACTIVE_UID_KEY, uid); resetAllRevealStates();
+
+    // First-time Dev init (only if cloud had no record yet & mail wasn't wiped)
+    if (acc.isDev && (Number(acc.editVer) || 0) === 0) {
+        acc.editVer = 1;
+        if (syncMeta.wipeAllMailVer === 0) {
+            pushMail(acc, {
+                id: 'dev_welcome_root',
+                kind: 'system',
+                title: 'Dev Root Initialized',
+                sender: 'SYSTEM',
+                body: 'ACCESS: Full Dev Console, Broadcast Mail, Season Engine & Live DB Sync\nSYNC: Your Dev UID works across PC & Mobile automatically'
+            });
+        }
+        saveAccountsCache();
+        publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(acc) });
+    }
+
     if (!acc.isDev) { devGodModeActive = false; lbDevManageMode = false; }
-    syncSeasonLifecycle();
-    reconcileAllTimeChampion();
+    syncSeasonLifecycle(false);
+    reconcileAllTimeChampion(false);
     if (acc.custom.nitroSkin !== 'standard' && !hasNitroSkinUnlocked(acc, acc.custom.nitroSkin)) { acc.custom.nitroSkin = 'standard'; saveAccountsCache(); }
     if (!isBiomeUnlockedForAccount(biomeIdx)) { biomeIdx = 0; cachedGradients.key = ''; }
     if (globalSettings.audio.ostMode === 'mitadru' && !acc.isDev) selectOstMode('synth');
@@ -3168,15 +3817,17 @@ async function deleteAccountByUid(uid, askDevConfirm = true) {
 function refreshSeasonUI() {
     seasonStatusCache = computeSeasonStatus();
     const st = seasonStatusCache, cd = formatCountdown(st.remainingMs);
-    const pill = document.getElementById('menuSeasonPill'), stTxt = document.getElementById('menuSeasonStatusText'), lbSub = document.getElementById('lbSeasonHeaderSub');
+    const pill = document.getElementById('menuSeasonPill'), stTxt = document.getElementById('menuSeasonStatusText'), lbSub = document.getElementById('lbSeasonHeaderSub'), devSsn = document.getElementById('devSeasonStateLabel');
     if (st.phase === 'ACTIVE') {
         if (pill) { pill.className = 'badge badge-amber mono'; pill.innerText = `S${st.seasonNum} • ${cd}`; }
         if (stTxt) stTxt.innerText = `SEASON ${st.seasonNum} • ${cd} LEFT`;
         if (lbSub) lbSub.innerText = currentLbTab === 'season' ? `Season ${st.seasonNum} • ${cd} remaining` : 'All-Time Hall of Fame';
+        if (devSsn) { devSsn.className = 'badge badge-amber mono'; devSsn.innerText = `S${st.seasonNum} • ACTIVE (${cd})`; }
     } else {
         if (pill) { pill.className = 'badge badge-sky mono'; pill.innerText = `GAP • S${st.nextSeasonNum} in ${cd}`; }
         if (stTxt) stTxt.innerText = `OFF-SEASON GAP (S${st.nextSeasonNum} in ${cd})`;
         if (lbSub) lbSub.innerText = currentLbTab === 'season' ? `Off-Season Gap • Season ${st.nextSeasonNum} in ${cd}` : 'All-Time Hall of Fame';
+        if (devSsn) { devSsn.className = 'badge badge-sky mono'; devSsn.innerText = `S${st.seasonNum} • GAP (${cd})`; }
     }
     updateTopLeaderBanner();
 }
@@ -3189,7 +3840,28 @@ function updateTopLeaderBanner() {
     } else { setTextCached('menuTopLeaderName', 'Unclaimed'); setTextCached('menuTopLeaderScore', ''); setTextCached('hudLeaderMini', 'Unclaimed'); }
 }
 
-// INBOX
+// INBOX (Phone-Style Persistent Read / Permanent Delete + Structured Layout)
+function isMailRewardActiveUnclaimed(m) {
+    if (!m || !m.reward || m.reward.claimed) return false;
+    const st = seasonStatusCache;
+    const expired = (st.phase === 'ACTIVE' && m.reward.validForSeason < st.seasonNum) || (st.phase === 'GAP' && m.reward.validForSeason <= st.seasonNum);
+    return !expired;
+}
+function formatStructuredMailBody(bodyStr) {
+    return escapeHtml(bodyStr || '').split('\n').map(line => {
+        const trimmed = line.trim();
+        if (!trimmed) return '<div style="height:3px;"></div>';
+        const m = trimmed.match(/^([A-Z0-9 #/\-]+):(?:\s+)(.+)$/);
+        if (m) return `<div class="mail-kv"><span class="mono mail-k">${m[1]}:</span><span class="mail-v">${m[2]}</span></div>`;
+        return `<div class="mail-line">${trimmed}</div>`;
+    }).join('');
+}
+function getMailKindBadge(kind) {
+    if (kind === 'broadcast') return '<span class="badge badge-cyan mono" style="font-size:8px;">📢 BROADCAST</span>';
+    if (kind === 'season') return '<span class="badge badge-amber mono" style="font-size:8px;">🏆 SEASON</span>';
+    if (kind === 'hof') return '<span class="badge badge-violet mono" style="font-size:8px;">👑 HALL OF FAME</span>';
+    return '<span class="badge badge-sky mono" style="font-size:8px;">⚙️ SYSTEM</span>';
+}
 function refreshInboxBadgeUI() {
     const unread = activeAccount ? (activeAccount.inbox || []).filter(m => !m.read).length : 0;
     const b = document.getElementById('menuInboxBadge');
@@ -3198,7 +3870,7 @@ function refreshInboxBadgeUI() {
 }
 function openInboxModal() {
     if (!activeAccount) { showToast('Sign in or create an account first.', 'err'); return; }
-    syncSeasonLifecycle(); renderInboxList();
+    syncSeasonLifecycle(false); renderInboxList();
     document.getElementById('inboxModal').style.display = 'flex'; syncCursorVisibility();
 }
 function closeInboxModal() { document.getElementById('inboxModal').style.display = 'none'; refreshInboxBadgeUI(); syncCursorVisibility(); }
@@ -3218,14 +3890,21 @@ function renderInboxList() {
                     ? `<div class="recessed-well row-between" style="padding:7px 9px;margin-top:7px;border-color:rgba(16,185,129,0.35);"><span class="mono" style="font-size:10px;color:#34d399;">🎁 ${escapeHtml(m.reward.skinName)} (S${m.reward.validForSeason})</span><span class="badge badge-emerald mono">CLAIMED</span></div>`
                     : `<div class="recessed-well row-between" style="padding:7px 9px;margin-top:7px;border-color:rgba(245,158,11,0.45);"><span class="mono" style="font-size:10px;color:#fcd34d;">🎁 ${escapeHtml(m.reward.skinName)} (S${m.reward.validForSeason})</span><button type="button" class="btn btn-xs btn-amber" onclick="event.stopPropagation();claimInboxReward('${escapeHtml(m.id)}')">Claim</button></div>`);
         }
-        return `<div class="mail-item ${m.read ? '' : 'unread'}" onclick="markMailRead('${escapeHtml(m.id)}')"><div class="row-between"><strong style="font-size:12px;color:#fff;">${escapeHtml(m.title)}</strong><span class="mono" style="font-size:9px;color:var(--text-dim);">${new Date(m.ts).toLocaleString()}</span></div><div class="mono" style="font-size:9px;color:#7dd3fc;margin-top:1px;">${escapeHtml(m.sender)}</div><div style="font-size:11.5px;color:#cbd5e1;margin-top:5px;white-space:pre-line;line-height:1.45;">${escapeHtml(m.body)}</div>${rw}</div>`;
+        const delBtn = isMailRewardActiveUnclaimed(m)
+            ? ''
+            : `<button type="button" class="btn btn-danger mail-del-btn" title="Delete message permanently" onclick="event.stopPropagation();deleteMailById('${escapeHtml(m.id)}')">✕</button>`;
+        return `<div class="mail-item ${m.read ? '' : 'unread'}" onclick="markMailRead('${escapeHtml(m.id)}')"><div class="row-between" style="gap:6px;"><div class="row-wrap" style="gap:5px;min-width:0;">${getMailKindBadge(m.kind)}<strong style="font-size:12px;color:#fff;">${escapeHtml(m.title)}</strong></div><div class="row" style="gap:6px;flex-shrink:0;"><span class="mono" style="font-size:9px;color:var(--text-dim);">${new Date(m.ts).toLocaleString()}</span>${delBtn}</div></div><div class="mono" style="font-size:9px;color:#7dd3fc;margin-top:2px;">${escapeHtml(m.sender)}</div><div class="mail-body">${formatStructuredMailBody(m.body)}</div>${rw}</div>`;
     }).join('');
 }
 function markMailRead(id) {
-    if (!activeAccount) return;
-    const m = activeAccount.inbox.find(x => x.id === id);
+    if (!activeAccount || !id) return;
+    const mid = sanitizeDbKey(id);
+    const m = (activeAccount.inbox || []).find(x => sanitizeDbKey(x.id) === mid);
     if (m && !m.read) {
         m.read = true;
+        if (!activeAccount.readMailIds || typeof activeAccount.readMailIds !== 'object') activeAccount.readMailIds = {};
+        activeAccount.readMailIds[mid] = true;
+        activeAccount.updatedAt = Date.now();
         saveAccountsCache();
         renderInboxList();
         publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(activeAccount) });
@@ -3233,22 +3912,66 @@ function markMailRead(id) {
 }
 function markAllInboxRead() {
     if (!activeAccount) return;
-    activeAccount.inbox.forEach(m => { m.read = true; });
+    if (!activeAccount.readMailIds || typeof activeAccount.readMailIds !== 'object') activeAccount.readMailIds = {};
+    let changed = false;
+    (activeAccount.inbox || []).forEach(m => {
+        if (!m || !m.id) return;
+        const mid = sanitizeDbKey(m.id);
+        if (!m.read) { m.read = true; changed = true; }
+        if (!activeAccount.readMailIds[mid]) { activeAccount.readMailIds[mid] = true; changed = true; }
+    });
+    if (!changed) return;
+    activeAccount.updatedAt = Date.now();
     saveAccountsCache();
     renderInboxList();
     publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(activeAccount) });
 }
-function clearReadInboxMail() {
-    if (!activeAccount) return;
-    activeAccount.inbox = activeAccount.inbox.filter(m => !m.read || (m.reward && !m.reward.claimed));
+function deleteMailById(id) {
+    if (!activeAccount || !id) return;
+    const mid = sanitizeDbKey(id);
+    const idx = (activeAccount.inbox || []).findIndex(m => m && sanitizeDbKey(m.id) === mid);
+    if (idx < 0) return;
+    if (isMailRewardActiveUnclaimed(activeAccount.inbox[idx])) {
+        showToast('Claim the active reward before deleting.', 'err'); playSfx('hit'); return;
+    }
+    activeAccount.inbox.splice(idx, 1);
+    if (!activeAccount.deletedMailIds || typeof activeAccount.deletedMailIds !== 'object') activeAccount.deletedMailIds = {};
+    activeAccount.deletedMailIds[mid] = true;
+    activeAccount.updatedAt = Date.now();
     saveAccountsCache();
     renderInboxList();
+    publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(activeAccount) });
+    showToast('Message deleted.', 'info');
+    playSfx('uiClick');
+}
+function clearReadInboxMail() {
+    if (!activeAccount) return;
+    if (!activeAccount.deletedMailIds || typeof activeAccount.deletedMailIds !== 'object') activeAccount.deletedMailIds = {};
+    let removed = 0;
+    activeAccount.inbox = (activeAccount.inbox || []).filter(m => {
+        const keep = !m || !m.read || isMailRewardActiveUnclaimed(m);
+        if (!keep && m && m.id) {
+            activeAccount.deletedMailIds[sanitizeDbKey(m.id)] = true;
+            removed++;
+        }
+        return keep;
+    });
+    if (!removed) { showToast('No read messages to clear.', 'info'); return; }
+    activeAccount.updatedAt = Date.now();
+    saveAccountsCache();
+    renderInboxList();
+    publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(activeAccount) });
+    showToast(`Deleted ${removed} read message${removed > 1 ? 's' : ''}.`, 'ok');
+    playSfx('uiClick');
 }
 function claimInboxReward(id) {
-    if (!activeAccount) return;
-    const m = activeAccount.inbox.find(x => x.id === id);
+    if (!activeAccount || !id) return;
+    const mid = sanitizeDbKey(id);
+    const m = (activeAccount.inbox || []).find(x => x && sanitizeDbKey(x.id) === mid);
     if (!m || !m.reward || m.reward.claimed) return;
     m.reward.claimed = true; m.read = true;
+    if (!activeAccount.readMailIds || typeof activeAccount.readMailIds !== 'object') activeAccount.readMailIds = {};
+    activeAccount.readMailIds[mid] = true;
     const sk = (activeAccount.seasonalSkins || []).find(s => s.skinId === m.reward.skinId && s.validForSeason === m.reward.validForSeason);
     if (sk) sk.claimed = true; else activeAccount.seasonalSkins.push({ skinId: m.reward.skinId, wonSeason: m.reward.wonSeason, validForSeason: m.reward.validForSeason, claimed: true, expired: false, rank: m.reward.rank });
     activeAccount.custom.nitroSkin = m.reward.skinId; activeAccount.updatedAt = Date.now();
@@ -3261,7 +3984,7 @@ function claimInboxReward(id) {
 // LEADERBOARD
 function openLeaderboardModal() {
     if (!activeAccount) { showToast('Sign in or create an account first.', 'err'); return; }
-    syncSeasonLifecycle(); refreshSeasonUI();
+    syncSeasonLifecycle(false); refreshSeasonUI();
     document.getElementById('lbDevManageBtn').classList.toggle('hidden', !(activeAccount && activeAccount.isDev));
     renderLeaderboardList();
     document.getElementById('leaderboardModal').style.display = 'flex'; syncCursorVisibility();
@@ -3365,7 +4088,7 @@ function openSettingsModal(tab = 'game') {
     document.getElementById('inGameRestartBtn').classList.toggle('hidden', !gameState.running);
     document.getElementById('inGameMenuBtn').classList.toggle('hidden', !gameState.running);
     syncDevUiVisibility(); switchSettingsTab(tab);
-    buildBiomeSelectorGrid(); buildGarageUI(); buildGraphicsUI(); syncOstButtonsUI(); refreshMenuAccountUI(); renderDevAccountsList(); renderDevCustomSongsList();
+    buildBiomeSelectorGrid(); buildGarageUI(); buildGraphicsUI(); syncOstButtonsUI(); refreshMenuAccountUI(); refreshSeasonUI(); renderDevAccountsList(); renderDevCustomSongsList();
     document.getElementById('pauseSettingsModal').style.display = 'flex';
     if (tab === 'garage') setTimeout(syncGarageCanvasResolution, 30);
     syncCursorVisibility();
@@ -3393,7 +4116,7 @@ function switchSettingsTab(tab) {
     });
     if (tab === 'garage') setTimeout(syncGarageCanvasResolution, 20);
     if (tab === 'profile') refreshMenuAccountUI();
-    if (tab === 'dev') { renderDevAccountsList(); renderDevCustomSongsList(); }
+    if (tab === 'dev') { refreshSeasonUI(); renderDevAccountsList(); renderDevCustomSongsList(); }
 }
 function syncDevUiVisibility() {
     const isDev = Boolean(activeAccount && activeAccount.isDev);
@@ -3516,20 +4239,172 @@ function showDevFeedback(msg) { const el = document.getElementById('devConsoleFe
 function toggleDevGodMode() { if (!activeAccount || !activeAccount.isDev) return; devGodModeActive = !devGodModeActive; if (devGodModeActive) { gameState.armor = 100; gameState.nitroFuel = 100; gameState.empCharge = 100; updateHudDOM(true); } syncDevUiVisibility(); playSfx('pickup'); showDevFeedback(devGodModeActive ? '⚡ God Mode ON' : 'God Mode OFF'); }
 function devRefillAllSystems() { if (!activeAccount || !activeAccount.isDev) return; gameState.armor = 100; gameState.nitroFuel = 100; gameState.empCharge = 100; updateHudDOM(true); spawnFloat('⚡ MAX ALL SYSTEMS', '#00f5d4', -45); playSfx('pickup'); }
 function devStartAtCustomEpoch() { if (!activeAccount || !activeAccount.isDev) return; startGameSession(Math.max(1, Math.min(99999, parseInt(document.getElementById('devEpochInput').value, 10) || 250))); }
-function devFastForwardSeasonPhase() {
+
+function setSeasonClockTo(targetSeasonNum, targetPhase) {
+    const sNum = Math.max(1, Math.floor(targetSeasonNum));
+    const phase = targetPhase === 'GAP' ? 'GAP' : 'ACTIVE';
+    const targetElapsed = (sNum - 1) * SEASON_CYCLE_MS + (phase === 'GAP' ? SEASON_ACTIVE_MS : 0) + 1500;
+    const origin = Number(seasonStateCache.originTs) || CANONICAL_SEASON_ORIGIN;
+    seasonStateCache.devOffsetMs = (origin + targetElapsed) - Date.now();
+    seasonStateCache.seasonVer = Math.max(1, Number(seasonStateCache.seasonVer) || 1) + 1;
+}
+
+function devStepSeasonPhase(dir) {
     if (!activeAccount || !activeAccount.isDev) return;
     seasonStatusCache = computeSeasonStatus();
-    seasonStateCache.devOffsetMs = (Number(seasonStateCache.devOffsetMs) || 0) + seasonStatusCache.remainingMs + 2500;
-    seasonStateCache.seasonVer = (Number(seasonStateCache.seasonVer) || 1) + 1;
-    saveSeasonState();
-    syncSeasonLifecycle();
+    const curS = seasonStatusCache.seasonNum, curP = seasonStatusCache.phase;
+    let nextS = curS, nextP = curP;
+
+    if (dir >= 0) {
+        if (curP === 'ACTIVE') { nextS = curS; nextP = 'GAP'; }
+        else { nextS = curS + 1; nextP = 'ACTIVE'; }
+        setSeasonClockTo(nextS, nextP);
+        saveSeasonState();
+        syncSeasonLifecycle(false);
+    } else {
+        if (curS <= 1 && curP === 'ACTIVE') {
+            showToast('Already at Season 1 (Active).', 'info');
+            return;
+        }
+        if (curP === 'GAP') { nextS = curS; nextP = 'ACTIVE'; }
+        else { nextS = Math.max(1, curS - 1); nextP = 'GAP'; }
+        setSeasonClockTo(nextS, nextP);
+        seasonStateCache.lastFinalizedSeason = nextP === 'GAP' ? nextS : Math.max(0, nextS - 1);
+        seasonStateCache.lastAnnouncedSeason = nextS;
+        Object.values(accountsCache).forEach(acc => {
+            if ((Number(acc.joinedSeason) || 1) > nextS) acc.joinedSeason = nextS;
+        });
+        saveAccountsCache();
+        saveSeasonState();
+    }
+
     refreshAllLiveViews();
     publishRealtimeEvent('season_sync', { seasonState: getSharedSeasonPayload() });
-    showDevFeedback(`⏩ Season ${seasonStatusCache.seasonNum} (${seasonStatusCache.phase}) synced live to all devices.`);
-    showToast(`Advanced to S${seasonStatusCache.seasonNum} (${seasonStatusCache.phase})`, 'ok');
+    showDevFeedback(`${dir >= 0 ? '⏩' : '⏪'} Season ${seasonStatusCache.seasonNum} (${seasonStatusCache.phase}) synced live.`);
+    showToast(`Season ${seasonStatusCache.seasonNum} (${seasonStatusCache.phase})`, 'ok');
     playSfx('pickup');
 }
-    
+
+function devShiftSeason(delta) {
+    if (!activeAccount || !activeAccount.isDev) return;
+    seasonStatusCache = computeSeasonStatus();
+    const curS = seasonStatusCache.seasonNum, curP = seasonStatusCache.phase;
+    const targetS = Math.max(1, curS + delta);
+    if (delta < 0 && curS <= 1 && curP === 'ACTIVE') {
+        showToast('Already at Season 1 (Active).', 'info');
+        return;
+    }
+    setSeasonClockTo(targetS, 'ACTIVE');
+    if (delta < 0) {
+        seasonStateCache.lastFinalizedSeason = Math.max(0, targetS - 1);
+        seasonStateCache.lastAnnouncedSeason = targetS;
+        Object.values(accountsCache).forEach(acc => {
+            if ((Number(acc.joinedSeason) || 1) > targetS) acc.joinedSeason = targetS;
+        });
+        saveAccountsCache();
+        saveSeasonState();
+    } else {
+        saveSeasonState();
+        syncSeasonLifecycle(false);
+    }
+    refreshAllLiveViews();
+    publishRealtimeEvent('season_sync', { seasonState: getSharedSeasonPayload() });
+    showDevFeedback(`⏪ Jumped to Season ${seasonStatusCache.seasonNum} (ACTIVE) across all devices.`);
+    showToast(`Season ${seasonStatusCache.seasonNum} (ACTIVE)`, 'ok');
+    playSfx('pickup');
+}
+
+function devFastForwardSeasonPhase() { devStepSeasonPhase(1); }
+
+async function devResetSeasons() {
+    if (!activeAccount || !activeAccount.isDev) return;
+    const ok = await askConfirm({
+        title: 'Reset Seasons to Season 1?',
+        body: 'Resets the season timer back to Season 1 (Active), clears seasonal leaderboards, seasonal skins & old season messages across ALL connected devices.\nAll-Time scores are preserved.',
+        okLabel: 'Reset to S1'
+    });
+    if (!ok) return;
+    const nextResetVer = (Number(seasonStateCache.seasonResetVer) || 0) + 1;
+    const nextSeasonState = {
+        originTs: Date.now(),
+        devOffsetMs: 0,
+        seasonVer: Math.max(1, Number(seasonStateCache.seasonVer) || 1) + 1,
+        seasonResetVer: nextResetVer,
+        lastFinalizedSeason: 0,
+        lastAnnouncedSeason: 1
+    };
+    applySeasonResetLocally(nextSeasonState);
+    refreshAllLiveViews();
+    publishRealtimeEvent('season_reset', { seasonState: getSharedSeasonPayload() });
+    showDevFeedback('↺ Seasons reset to Season 1 (Active) live.');
+    showToast('Seasons reset to Season 1.', 'ok');
+    playSfx('pickup');
+}
+
+function devSendBroadcastMail() {
+    if (!activeAccount || !activeAccount.isDev) return;
+    const titleEl = document.getElementById('devBroadcastTitle');
+    const bodyEl = document.getElementById('devBroadcastBody');
+    const title = ((titleEl && titleEl.value) || '').trim();
+    const body = ((bodyEl && bodyEl.value) || '').trim();
+    if (!title || !body) {
+        showToast('Enter both a Broadcast Subject and Message.', 'err');
+        playSfx('hit');
+        return;
+    }
+    const nowTs = Date.now();
+    const mailObj = {
+        id: `bc_${nowTs}_${Math.floor(Math.random() * 1e5)}`,
+        kind: 'broadcast',
+        seasonNum: 0,
+        title,
+        sender: `DEV BROADCAST (${activeAccount.name})`,
+        body,
+        ts: nowTs,
+        read: false,
+        reward: null
+    };
+    deliverBroadcastMailLocally(mailObj, false);
+    if (titleEl) titleEl.value = '';
+    if (bodyEl) bodyEl.value = '';
+    publishRealtimeEvent('mail_broadcast', { mail: mailObj });
+    refreshAllLiveViews();
+    showDevFeedback(`📢 Broadcast "${title}" delivered live.`);
+    showToast('Broadcast sent live to all pilots.', 'ok');
+    playSfx('pickup');
+}
+
+async function devResetAllMessages() {
+    if (!activeAccount || !activeAccount.isDev) return;
+    const ok = await askConfirm({
+        title: 'Reset ALL Messages?',
+        body: 'Permanently wipe ALL inbox messages & broadcasts for EVERY account across all connected devices?',
+        okLabel: 'Reset All Mail'
+    });
+    if (!ok) return;
+    publishRealtimeEvent('mail_reset_all', { ts: Date.now() });
+    refreshAllLiveViews();
+    showDevFeedback('✓ All inbox & broadcast messages wiped live.');
+    showToast('All messages wiped live.', 'ok');
+    playSfx('pickup');
+}
+
+async function devResetAllCustomSongs() {
+    if (!activeAccount || !activeAccount.isDev) return;
+    const ok = await askConfirm({
+        title: 'Remove ALL Custom Songs?',
+        body: 'Permanently delete ALL custom uploaded tracks from IndexedDB and sync removal across all connected devices?',
+        okLabel: 'Remove All Songs'
+    });
+    if (!ok) return;
+    await clearAllLocalSongsStore();
+    publishRealtimeEvent('songs_reset_all', { ts: Date.now() });
+    renderDevCustomSongsList();
+    showDevFeedback('✓ All custom songs removed live across all devices.');
+    showToast('All custom songs removed.', 'ok');
+    playSfx('pickup');
+}
+
 async function devResetSpecificScore(uid) {
     if (!activeAccount || !activeAccount.isDev || !uid) return;
     const target = accountsCache[uid];
@@ -3537,7 +4412,7 @@ async function devResetSpecificScore(uid) {
     if (!ok) return;
     const now = Date.now(); syncMeta.resetScoreTs[uid] = now; saveSyncMeta();
     applyScoreResetLocally(uid); publishRealtimeEvent('score_reset', { uid, ts: now });
-    reconcileAllTimeChampion(); refreshMenuAccountUI(); buildGarageUI(); renderDevAccountsList();
+    reconcileAllTimeChampion(false); refreshMenuAccountUI(); buildGarageUI(); renderDevAccountsList();
     if (document.getElementById('leaderboardModal').style.display === 'flex') renderLeaderboardList();
     showDevFeedback(`✓ Score reset live for ${target ? target.name : uid}.`); showToast('Specific score reset live.', 'ok'); playSfx('pickup');
 }
@@ -3559,7 +4434,7 @@ async function devDeleteAllNonDevAccounts() {
     if (!ok) return;
     const now = Date.now(); syncMeta.wipeAllAccountsTs = now; saveSyncMeta();
     applyDeleteAllNonDevLocally(now, false); publishRealtimeEvent('acc_delete_all', { ts: now });
-    reconcileAllTimeChampion(); refreshMenuAccountUI(); buildGarageUI(); renderDevAccountsList(); renderDevCustomSongsList();
+    reconcileAllTimeChampion(false); refreshMenuAccountUI(); buildGarageUI(); renderDevAccountsList(); renderDevCustomSongsList();
     if (document.getElementById('leaderboardModal').style.display === 'flex') renderLeaderboardList();
     showDevFeedback(`✓ Deleted ${victims.length} player accounts live.`); showToast(`Deleted ${victims.length} player accounts live.`, 'ok'); playSfx('pickup');
 }
@@ -3599,7 +4474,7 @@ function startGameSession(startEp = 1) {
     hasTrustedGesture = true; isBootSplashDismissed = true;
     document.getElementById('bootSplashModal').style.display = 'none';
     if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
-    ensureAudioEngine(); syncSeasonLifecycle();
+    ensureAudioEngine(); syncSeasonLifecycle(false);
     if (isMobileHardware) requestMobileFullscreenSafe();
     resizeGameCanvas();
     if (globalSettings.controls.mobileMode === 'tilt') calibrateTiltSensor(true);
@@ -3628,7 +4503,7 @@ function returnToMainMenu() {
     syncEpoch250Banners(); syncExternalTracks(); updateEnginePitch(); updateEqVisuals(false);
     ['pauseSettingsModal', 'gameOverModal', 'leaderboardModal', 'inboxModal', 'confirmModal'].forEach(id => { document.getElementById(id).style.display = 'none'; });
     document.getElementById('startModal').style.display = 'flex';
-    syncSeasonLifecycle(); refreshMenuAccountUI(); refreshSeasonUI(); refreshInboxBadgeUI(); syncCursorVisibility();
+    syncSeasonLifecycle(false); refreshMenuAccountUI(); refreshSeasonUI(); refreshInboxBadgeUI(); syncCursorVisibility();
 }
 
 function exitGamePortal() {
@@ -3821,7 +4696,7 @@ Object.assign(window, {
     deleteActiveAccountSelf, deleteAccountByUid,
     resolveConfirmModal, forceManualCloudSync,
     startGameSession, returnToMainMenu, exitGamePortal, toggleGameHudVisibility,
-    openInboxModal, closeInboxModal, markMailRead, markAllInboxRead, clearReadInboxMail, claimInboxReward,
+    openInboxModal, closeInboxModal, markMailRead, markAllInboxRead, deleteMailById, clearReadInboxMail, claimInboxReward,
     openLeaderboardModal, closeLeaderboardModal, switchLeaderboardTab, toggleLbDevManage,
     openSettingsModal, resumeFromSettings, switchSettingsTab,
     setDifficulty, selectManualBiome, toggleAutoBiomeCycle, resetGameSettingsOnly,
@@ -3830,7 +4705,9 @@ Object.assign(window, {
     selectOstMode, updateVolumeSetting, handleCustomSongUpload, removeCurrentPilotCustomSong, deleteCustomSongByUid, resetSoundSettingsOnly,
     setMobileControlMode, toggleInvertGyro, calibrateTiltSensor, updateGyroSpeedSetting, toggleDoubleTapNitro, startKeyRebind, resetControlSettingsOnly,
     applyGraphicsPreset, updateGfxResolution, updateGfxDrawSlices, updateGfxParticles, toggleGfxOption, setVisualFilter, resetGraphicsSettingsOnly,
-    toggleDevGodMode, devRefillAllSystems, devStartAtCustomEpoch, devFastForwardSeasonPhase,
+    toggleDevGodMode, devRefillAllSystems, devStartAtCustomEpoch,
+    devShiftSeason, devStepSeasonPhase, devFastForwardSeasonPhase, devResetSeasons,
+    devSendBroadcastMail, devResetAllMessages, devResetAllCustomSongs,
     devResetSpecificScore, devResetAllScores, devDeleteAllNonDevAccounts,
     toggleDevRevealAllIds, toggleDevRowReveal, renderDevAccountsList,
     steerLane, setBoosting, setBraking, triggerNeuralEmp
@@ -3841,9 +4718,9 @@ Object.assign(window, {
 // =========================================================================
 detectDeviceHardware();
 validateAndSanitizeDatabase();
+syncSeasonLifecycle(false);
+reconcileAllTimeChampion(false);
 restoreFromIndexedDBIfNeeded();
-syncSeasonLifecycle();
-reconcileAllTimeChampion();
 
 setDifficulty(globalSettings.difficulty);
 buildVolumeSlidersUI();
@@ -3875,7 +4752,7 @@ setInterval(() => {
     seasonStatusCache = computeSeasonStatus();
     if ((seasonStatusCache.phase === 'GAP' && (Number(seasonStateCache.lastFinalizedSeason) || 0) < seasonStatusCache.seasonNum) ||
         (seasonStatusCache.phase === 'ACTIVE' && ((Number(seasonStateCache.lastAnnouncedSeason) || 0) < seasonStatusCache.seasonNum || (Number(seasonStateCache.lastFinalizedSeason) || 0) < seasonStatusCache.seasonNum - 1))) {
-        syncSeasonLifecycle();
+        syncSeasonLifecycle(true);
     } else if (!gameState.running) {
         refreshSeasonUI();
     }
