@@ -113,7 +113,7 @@
 
                             <div id="authLoginPane" class="stack-xs hidden">
                                 <div class="row-wrap">
-                                    <input type="text" id="loginUidInput" maxlength="24" inputmode="numeric" autocomplete="off" placeholder="Enter Unique 17-Digit UID" class="mono" style="flex:1 1 155px;min-width:135px;letter-spacing:0.06em;" onkeydown="if(event.key==='Enter')signInWithUid()">
+                                    <input type="text" id="loginUidInput" maxlength="40" inputmode="numeric" autocomplete="off" placeholder="Enter Unique 17-Digit UID" class="mono" style="flex:1 1 155px;min-width:135px;letter-spacing:0.06em;" onkeydown="if(event.key==='Enter')signInWithUid()">
                                     <button type="button" class="btn btn-sky active" style="flex:0 0 auto;" onclick="signInWithUid()">Sign In</button>
                                 </div>
                             </div>
@@ -209,7 +209,7 @@
                 </div>
                 <div class="row-wrap">
                     <button type="button" class="btn btn-xs" onclick="markAllInboxRead()">✓ Read All</button>
-                    
+                    <button type="button" class="btn btn-xs btn-danger" onclick="clearReadInboxMail()">🗑️ Clear Read</button>
                     <button type="button" class="btn btn-sm" onclick="closeInboxModal()">← Back</button>
                 </div>
             </div>
@@ -527,15 +527,39 @@
 
                         <div class="row-between recessed-well" style="padding:7px 9px;flex-wrap:wrap;">
                             <span class="mono" style="font-size:10.5px;font-weight:700;">WARP EPOCH</span>
-                            <div class="row">
+                            <div class="row-wrap">
                                 <input type="number" id="devEpochInput" min="1" max="99999" value="250" class="mono" style="width:80px;text-align:center;">
                                 <button type="button" class="btn btn-xs btn-sky active" onclick="devStartAtCustomEpoch()">▶ Warp</button>
+                                <button type="button" id="devGodModeBtn" class="btn btn-xs btn-sky" onclick="toggleDevGodMode()">God Mode: OFF</button>
                             </div>
                         </div>
 
-                        <div class="grid-2">
-                            <button type="button" id="devGodModeBtn" class="btn btn-xs btn-sky" onclick="toggleDevGodMode()">God Mode: OFF</button>
-                            <button type="button" class="btn btn-xs btn-amber" onclick="devFastForwardSeasonPhase()">⏩ Next Season Phase</button>
+                        <!-- SEASON ENGINE (- / + / RESET) -->
+                        <div class="recessed-well stack-xs" style="padding:8px 9px;">
+                            <div class="row-between" style="flex-wrap:wrap;gap:6px;">
+                                <span class="mono" style="font-size:10px;font-weight:700;color:#fcd34d;">SEASON ENGINE (SYNCED LIVE)</span>
+                                <span id="devSeasonStateLabel" class="badge badge-amber mono">S1 &bull; ACTIVE</span>
+                            </div>
+                            <div class="grid-4">
+                                <button type="button" class="btn btn-xs btn-amber" onclick="devShiftSeason(-1)">⏪ -1 Ssn</button>
+                                <button type="button" class="btn btn-xs btn-amber" onclick="devStepSeasonPhase(-1)">◀ - Phase</button>
+                                <button type="button" class="btn btn-xs btn-amber" onclick="devStepSeasonPhase(1)">▶ + Phase</button>
+                                <button type="button" class="btn btn-xs btn-danger" onclick="devResetSeasons()">↺ Reset S1</button>
+                            </div>
+                        </div>
+
+                        <!-- BROADCAST MAIL & RESET ALL MAIL -->
+                        <div class="recessed-well stack-xs" style="padding:8px 9px;">
+                            <div class="row-between" style="flex-wrap:wrap;gap:6px;">
+                                <span class="mono" style="font-size:10px;font-weight:700;color:#7dd3fc;">📢 BROADCAST MAIL (LIVE DB)</span>
+                                <button type="button" class="btn btn-xs btn-danger" onclick="devResetAllMessages()">🗑️ Reset All Mail</button>
+                            </div>
+                            <input type="text" id="devBroadcastTitle" maxlength="64" autocomplete="off" placeholder="Broadcast Subject">
+                            <textarea id="devBroadcastBody" rows="2" maxlength="500" placeholder="Announcement message (only accounts created before send time receive it)..."></textarea>
+                            <div class="row-between" style="flex-wrap:wrap;gap:6px;">
+                                <span class="mono" style="font-size:9px;color:var(--text-dim);">Phone-style delivery &bull; Deleted stays gone</span>
+                                <button type="button" class="btn btn-xs btn-sky active" onclick="devSendBroadcastMail()">📤 Send Broadcast</button>
+                            </div>
                         </div>
 
                         <div class="grid-2">
@@ -558,7 +582,10 @@
                         </div>
 
                         <div class="recessed-well stack-xs" style="padding:8px 9px;">
-                            <div class="mono" style="font-size:10px;font-weight:700;color:#cbd5e1;">CUSTOM SONGS (INDEXEDDB)</div>
+                            <div class="row-between" style="flex-wrap:wrap;gap:6px;">
+                                <span class="mono" style="font-size:10px;font-weight:700;color:#cbd5e1;">CUSTOM SONGS (INDEXEDDB + DB)</span>
+                                <button type="button" class="btn btn-xs btn-danger" onclick="devResetAllCustomSongs()">🗑️ Remove All Songs</button>
+                            </div>
                             <div id="devCustomSongsList" class="stack-xs" style="font-size:10px;color:var(--text-muted);"></div>
                         </div>
 
