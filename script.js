@@ -429,9 +429,9 @@ const BIOME_THEMES = [
 let biomeIdx = 0;
 
 const DEFAULT_VEHICLE_CUST = {
-    bodyPrimary: '#1e293b', bodySecondary: '#38bdf8', canopyColor: '#7dd3fc',
+    bodyPrimary: '#475569', bodySecondary: '#38bdf8', canopyColor: '#7dd3fc',
     empColor: '#38bdf8', boostColor: '#fbbf24', nitroSkin: 'standard'
-};
+}
 const GARAGE_PRESETS = {
     steel:    { bodyPrimary: '#1e293b', bodySecondary: '#38bdf8', canopyColor: '#7dd3fc', empColor: '#38bdf8', boostColor: '#fbbf24' },
     cobalt:   { bodyPrimary: '#0f2544', bodySecondary: '#38bdf8', canopyColor: '#bae6fd', empColor: '#00f5d4', boostColor: '#38bdf8' },
