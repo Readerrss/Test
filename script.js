@@ -1827,17 +1827,6 @@ async function deleteCustomSongByUid(uid) {
         if (activeAccount && activeAccount.uid === uid) await loadCustomSongForActiveAccount(); else renderDevCustomSongsList();
     } catch (e) {}
 }
-async function devRemoveAllCustomSongs() {
-    if (!activeAccount || !activeAccount.isDev) return;
-    const ok = await askConfirm({ title: 'Clear All Custom Songs?', body: 'Remove every uploaded custom audio track from IndexedDB?', okLabel: 'Clear All' });
-    if (!ok) return;
-    try {
-        const db = await openLocalIDB();
-        await new Promise(res => { const tx = db.transaction('songs', 'readwrite'); tx.objectStore('songs').clear(); tx.oncomplete = () => res(); });
-        await loadCustomSongForActiveAccount();
-        showDevFeedback('✓ All custom songs cleared.'); showToast('All custom songs cleared.', 'ok'); playSfx('pickup');
-    } catch (e) {}
-}
 async function renderDevCustomSongsList() {
     const el = document.getElementById('devCustomSongsList');
     if (!el || !activeAccount || !activeAccount.isDev) return;
@@ -3850,7 +3839,7 @@ Object.assign(window, {
     setMobileControlMode, toggleInvertGyro, calibrateTiltSensor, updateGyroSpeedSetting, toggleDoubleTapNitro, startKeyRebind, resetControlSettingsOnly,
     applyGraphicsPreset, updateGfxResolution, updateGfxDrawSlices, updateGfxParticles, toggleGfxOption, setVisualFilter, resetGraphicsSettingsOnly,
     toggleDevGodMode, devRefillAllSystems, devStartAtCustomEpoch, devFastForwardSeasonPhase, devBroadcastSystemMail,
-    devResetSpecificScore, devResetAllScores, devDeleteAllNonDevAccounts, devRemoveAllCustomSongs,
+    devResetSpecificScore, devResetAllScores, devDeleteAllNonDevAccounts,
     toggleDevRevealAllIds, toggleDevRowReveal, renderDevAccountsList,
     steerLane, setBoosting, setBraking, triggerNeuralEmp
 });
