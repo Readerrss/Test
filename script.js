@@ -56,7 +56,7 @@ const LOCAL_IDB_VERSION      = 2;
 const CANONICAL_DEV_UID       = '84729160538274195';
 const DEFAULT_DEV_NAME        = 'Unknown';
 const DEFAULT_DEV_TAG         = '0000';
-const CANONICAL_SEASON_ORIGIN = 1795651200000; // Shared baseline timestamp so all devices calculate identical seasons
+const CANONICAL_SEASON_ORIGIN = 1732579200000; // Shared baseline timestamp so all devices calculate identical seasons
 const CLIENT_ID               = 'c_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now().toString(36);
 
 const SEASON_ACTIVE_MS = 3 * 24 * 60 * 60 * 1000;
