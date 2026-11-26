@@ -3528,16 +3528,7 @@ function devFastForwardSeasonPhase() {
     showDevFeedback(`⏩ Season ${seasonStatusCache.seasonNum} (${seasonStatusCache.phase}) synced live to all devices.`);
     showToast(`Advanced to S${seasonStatusCache.seasonNum} (${seasonStatusCache.phase})`, 'ok');
     playSfx('pickup');
-}
-function devBroadcastSystemMail() {
-    if (!activeAccount || !activeAccount.isDev) return;
-    const t = (document.getElementById('devMailTitleInput').value || '').trim(), b = (document.getElementById('devMailBodyInput').value || '').trim();
-    if (!t || !b) { showToast('Enter subject & message.', 'err'); return; }
-    const mailObj = pushMailAll({ title: t, sender: 'DEV BROADCAST', body: b });
-    publishRealtimeEvent('mail_broadcast', { mail: mailObj });
-    document.getElementById('devMailTitleInput').value = ''; document.getElementById('devMailBodyInput').value = '';
-    refreshInboxBadgeUI(); showDevFeedback(`✓ Sent "${t}" live to all browsers.`); showToast('Broadcast mail sent live.', 'ok'); playSfx('pickup');
-}
+    
 async function devResetSpecificScore(uid) {
     if (!activeAccount || !activeAccount.isDev || !uid) return;
     const target = accountsCache[uid];
@@ -3838,7 +3829,7 @@ Object.assign(window, {
     selectOstMode, updateVolumeSetting, handleCustomSongUpload, removeCurrentPilotCustomSong, deleteCustomSongByUid, resetSoundSettingsOnly,
     setMobileControlMode, toggleInvertGyro, calibrateTiltSensor, updateGyroSpeedSetting, toggleDoubleTapNitro, startKeyRebind, resetControlSettingsOnly,
     applyGraphicsPreset, updateGfxResolution, updateGfxDrawSlices, updateGfxParticles, toggleGfxOption, setVisualFilter, resetGraphicsSettingsOnly,
-    toggleDevGodMode, devRefillAllSystems, devStartAtCustomEpoch, devFastForwardSeasonPhase, devBroadcastSystemMail,
+    toggleDevGodMode, devRefillAllSystems, devStartAtCustomEpoch, devFastForwardSeasonPhase,
     devResetSpecificScore, devResetAllScores, devDeleteAllNonDevAccounts,
     toggleDevRevealAllIds, toggleDevRowReveal, renderDevAccountsList,
     steerLane, setBoosting, setBraking, triggerNeuralEmp
