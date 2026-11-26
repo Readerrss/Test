@@ -3528,6 +3528,7 @@ function devFastForwardSeasonPhase() {
     showDevFeedback(`⏩ Season ${seasonStatusCache.seasonNum} (${seasonStatusCache.phase}) synced live to all devices.`);
     showToast(`Advanced to S${seasonStatusCache.seasonNum} (${seasonStatusCache.phase})`, 'ok');
     playSfx('pickup');
+}
     
 async function devResetSpecificScore(uid) {
     if (!activeAccount || !activeAccount.isDev || !uid) return;
