@@ -197,14 +197,14 @@
         </div>
     </div>
 
-    <!-- GLOBAL INBOX -->
+    <!-- GLOBAL INBOX (Shared Across All Devices, 24h Auto-Delete, Per-User Read/Delete) -->
     <div id="inboxModal" class="modal-backdrop" style="z-index:72;">
         <div class="hardware-panel modal-card" style="max-width:650px;">
             <div class="modal-header">
                 <div class="row-wrap" style="gap:6px;">
-                    <h2 style="font-size:13px;font-weight:800;letter-spacing:0.04em;">📬 GLOBAL MAIL</h2>
+                    <h2 style="font-size:13px;font-weight:800;letter-spacing:0.04em;">📬 GLOBAL INBOX</h2>
                     <span id="inboxUnreadCountBadge" class="badge badge-sky mono">0 Unread</span>
-                    <span class="badge mono" style="font-size:8.5px;" title="Messages auto-delete after 24 hours">⏳ 24h TTL</span>
+                    <span class="badge mono" style="font-size:8.5px;color:var(--text-dim);" title="All messages automatically delete after 24 hours">⏳ 24h Auto-Clean</span>
                 </div>
                 <div class="row-wrap">
                     <button type="button" class="btn btn-xs" onclick="markAllInboxRead()">✓ Read All</button>
@@ -539,16 +539,16 @@
                             </div>
                         </div>
 
-                        <!-- GLOBAL BROADCAST MAIL & RESET ALL MAIL -->
+                        <!-- BROADCAST MAIL & RESET ALL MAIL -->
                         <div class="recessed-well stack-xs" style="padding:8px 9px;">
                             <div class="row-between" style="flex-wrap:wrap;gap:6px;">
-                                <span class="mono" style="font-size:10px;font-weight:700;color:#7dd3fc;">📢 GLOBAL BROADCAST (24h AUTO-DELETE)</span>
-                                <button type="button" class="btn btn-xs btn-danger" onclick="devResetAllMessages()">🗑️ Clear Global Mail</button>
+                                <span class="mono" style="font-size:10px;font-weight:700;color:#7dd3fc;">📢 GLOBAL BROADCAST MAIL</span>
+                                <button type="button" class="btn btn-xs btn-danger" onclick="devResetAllMessages()">🗑️ Reset All Mail</button>
                             </div>
                             <input type="text" id="devBroadcastTitle" maxlength="64" autocomplete="off" placeholder="Broadcast Subject">
-                            <textarea id="devBroadcastBody" rows="2" maxlength="500" placeholder="Global message visible to all pilots..."></textarea>
+                            <textarea id="devBroadcastBody" rows="2" maxlength="500" placeholder="Global announcement message (auto-deletes after 24h)..."></textarea>
                             <div class="row" style="justify-content:flex-end;">
-                                <button type="button" class="btn btn-xs btn-sky active" onclick="devSendBroadcastMail()">📤 Send Global Broadcast</button>
+                                <button type="button" class="btn btn-xs btn-sky active" onclick="devSendBroadcastMail()">📤 Send Broadcast</button>
                             </div>
                         </div>
 
