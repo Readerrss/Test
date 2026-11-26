@@ -55,7 +55,7 @@ input[type="range"] {
     cursor: pointer;
     min-height: 22px;
 }
-input[type="text"], input[type="number"] {
+input[type="text"], input[type="number"], textarea {
     touch-action: manipulation !important;
     user-select: text !important;
     -webkit-user-select: text !important;
@@ -65,14 +65,16 @@ input[type="text"], input[type="number"] {
     border-radius: 8px;
     padding: clamp(5px, 0.9vmin, 8px) clamp(8px, 1.2vmin, 11px);
     font-size: clamp(11px, 1.3vmin, 13px);
+    font-family: inherit;
     outline: none;
     transition: border-color 0.12s ease, box-shadow 0.12s ease;
 }
-input[type="text"]:focus, input[type="number"]:focus {
+textarea { width: 100%; resize: vertical; min-height: 48px; line-height: 1.4; }
+input[type="text"]:focus, input[type="number"]:focus, textarea:focus {
     border-color: #38bdf8;
     box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
 }
-input::placeholder { color: #4b5563; opacity: 1; }
+input::placeholder, textarea::placeholder { color: #4b5563; opacity: 1; }
 
 input[type="color"] {
     -webkit-appearance: none;
@@ -523,6 +525,12 @@ footer.hud-footer {
 .mail-item { background: #0d111a; border: 1px solid #1f2636; border-radius: 10px; padding: 9px 11px; cursor: pointer; transition: border-color 0.12s ease; }
 .mail-item:hover { border-color: #334155; }
 .mail-item.unread { border-left: 3px solid #38bdf8; background: #101726; }
+.mail-body { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; font-size: 11.5px; color: #cbd5e1; line-height: 1.42; }
+.mail-kv { display: flex; flex-wrap: wrap; gap: 5px; align-items: baseline; }
+.mail-k { font-size: 9.5px; font-weight: 700; color: #7dd3fc; letter-spacing: 0.04em; }
+.mail-v { color: #e2e8f0; }
+.mail-line { white-space: pre-line; }
+.mail-del-btn { padding: 1.5px 6px; font-size: 9.5px; line-height: 1.2; border-radius: 5px; }
 
 .lb-card { background: #0e131e; border: 1px solid #1f2738; border-radius: 10px; padding: 8px 11px; display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
 .lb-card-top5 { border-color: rgba(245, 158, 11, 0.45); background: linear-gradient(90deg, rgba(245, 158, 11, 0.08), #0e131e 42%); }
